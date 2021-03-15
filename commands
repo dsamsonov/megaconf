@@ -1,0 +1,3 @@
+sh version
+show chass routing
+sh int description | no-more
