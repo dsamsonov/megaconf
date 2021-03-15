@@ -15,6 +15,12 @@ import (
 	"time"
 )
 
+var (
+	promptRE = regexp.MustCompile("(>|#|\\$|>\\s|])$")
+	passRE   = regexp.MustCompile("assword:")
+	timeout  time.Duration
+)
+
 func Fatal(err error) {
 	fmt.Printf("\nERROR! %s\n\n", err)
 	os.Exit(1)
@@ -40,13 +46,9 @@ func ReadFile(file string) []string {
 	return out
 }
 
-func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, password string, commands []string, timeout time.Duration) {
-	var (
-		promptRE = regexp.MustCompile("(>|#|\\$|>\\s|])$")
-		passRE   = regexp.MustCompile("assword:")
-	)
+func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, password string, commands []string, port int) {
 	defer c.Done()
-	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p 22 %s", device), -1, expect.Verbose(*optDebug))
+	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p %d %s", port, device), -1, expect.Verbose(*optDebug))
 	if err != nil {
 		log.Printf("device %s, error: %s\n", device, err)
 		return
@@ -81,7 +83,6 @@ func main() {
 	var (
 		devices, commands []string
 		password          string
-		timeout           time.Duration
 	)
 
 	//parse command arguments
@@ -91,11 +92,11 @@ func main() {
 	optCmdFile := getopt.StringLong("cmdlist", 'c', "./commands", "file with commands list")
 	optJobs := getopt.IntLong("jobs", 'j', 1, "number of parallel device jobs")
 	optTimeout := getopt.IntLong("timeout", 't', 60, "timeout in seconds")
+	optPort := getopt.IntLong("port", 'P', 22, "connect to port")
 	optPassword := getopt.BoolLong("password", 'p', "promt for password")
 	optRun := getopt.BoolLong("run", 'r', "run commands")
 	optDebug := getopt.BoolLong("debug", 'd', "debug mode")
-
-	//    optLogFile := getopt.StringLong("log", 'l', "./megaconf.log", "Log file")
+	optLogFile := getopt.StringLong("log", 'l', "", "Log file")
 	getopt.Parse()
 	if *optHelp {
 		getopt.Usage()
@@ -128,14 +129,21 @@ func main() {
 		password = string(p)
 	}
 	timeout = time.Duration(*optTimeout) * time.Second
-
+	if *optLogFile != "" {
+		lf, err := os.Create(*optLogFile)
+		if err != nil {
+			Fatal(err)
+		}
+		log.SetOutput(lf)
+		defer lf.Close()
+	}
 	// connect to devices
 	c := goccm.New(*optJobs)
 
 	for di := 0; di < len(devices); di++ {
 		c.Wait()
 		fmt.Printf("\n\n##############################################\n#    Connecting to %s, [%d/%d]\n##############################################\n\n\n", devices[di], di+1, len(devices))
-		go CmdToDevice(c, devices[di], optDebug, password, commands, timeout)
+		go CmdToDevice(c, devices[di], optDebug, password, commands, *optPort)
 	}
 	c.WaitAllDone()
 }
