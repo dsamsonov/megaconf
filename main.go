@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"github.com/google/goexpect"
 	"github.com/howeyc/gopass"
@@ -65,7 +64,7 @@ func main() {
 	optPassword := getopt.BoolLong("password", 'p', "Promt for password")
 	optRun := getopt.BoolLong("run", 'r', "Run commands")
 	optDebug := getopt.BoolLong("debug", 'd', "Debug mode")
-	nParallelJobs := flag.Int("parallel", 10, "the number of parallel device jobs")
+	nParallelJobs := getopt.IntLong("parallel", 'n', 10, "the number of parallel device jobs")
 
 	//    optLogFile := getopt.StringLong("log", 'l', "./megaconf.log", "Log file")
 	getopt.Parse()
