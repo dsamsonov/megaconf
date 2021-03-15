@@ -1,8 +1,7 @@
 # megaconf
 Utility for fast run list of commands to many network hardware (routers,switches, servers, etc)
 
-Usage:
-Usage: megaconf [-?dprv] [-c value] [-h value] [-j value] [-l value] [-P value] [-t value] [parameters ...]
+Usage: megaconf [-?dprv] [-c value] [-h value] [-j value] [-l value] [-P value] [-t value] [-u value] [parameters ...]
  -?, --help         display help
  -c, --cmdlist=value
                     file with commands list [./commands]
@@ -15,6 +14,8 @@ Usage: megaconf [-?dprv] [-c value] [-h value] [-j value] [-l value] [-P value] 
  -r, --run          run commands
  -t, --timeout=value
                     timeout in seconds [60]
+ -u, --username=value
+                    Username
  -v, --version      display version
 
 by default output to console, if you want redirect output to file, use -l flag

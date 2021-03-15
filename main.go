@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"log"
 	"os"
+	"os/user"
 	"regexp"
 	"strings"
 	"time"
@@ -46,9 +47,9 @@ func ReadFile(file string) []string {
 	return out
 }
 
-func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, password string, commands []string, port int) {
+func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, username, password string, commands []string, port int) {
 	defer c.Done()
-	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p %d %s", port, device), -1, expect.Verbose(*optDebug))
+	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p %d -l %s %s", port,username, device), -1, expect.Verbose(*optDebug), expect.VerboseWriter(os.Stdout))
 	if err != nil {
 		log.Printf("device %s, error: %s\n", device, err)
 		return
@@ -70,7 +71,11 @@ func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, pass
 			log.Printf("device %s, error while sending command \"%s\": %s\n", device, commands[i], err)
 			return
 		}
-		result, _, _ := e.Expect(promptRE, timeout)
+		result, _, err := e.Expect(promptRE, timeout)
+		if err != nil {
+		        log.Printf("device %s, error after sending command \"%s\": %s\n", device, commands[i], err)
+    			return
+		}
 		log.Printf("device %s, result: %s\n", device, result)
 	}
 }
@@ -82,7 +87,7 @@ func main() {
 
 	var (
 		devices, commands []string
-		password          string
+		username,password string
 	)
 
 	//parse command arguments
@@ -90,6 +95,7 @@ func main() {
 	optVersion := getopt.BoolLong("version", 'v', "display version")
 	optDevFile := getopt.StringLong("hosts", 'h', "./devices.db", "file with devices list")
 	optCmdFile := getopt.StringLong("cmdlist", 'c', "./commands", "file with commands list")
+	optUsername := getopt.StringLong("username", 'u', "", "Username")
 	optJobs := getopt.IntLong("jobs", 'j', 1, "number of parallel device jobs")
 	optTimeout := getopt.IntLong("timeout", 't', 60, "timeout in seconds")
 	optPort := getopt.IntLong("port", 'P', 22, "connect to port")
@@ -111,6 +117,15 @@ func main() {
 		getopt.Usage()
 		os.Exit(0)
 	}
+	if *optUsername == "" {
+		currentUser, err := user.Current()
+		if err != nil {
+		    Fatal(err)
+		}
+    		username = currentUser.Username
+	} else {
+		username = *optUsername
+        }
 	//read files
 	devices = ReadFile(*optDevFile)
 	commands = ReadFile(*optCmdFile)
@@ -143,7 +158,7 @@ func main() {
 	for di := 0; di < len(devices); di++ {
 		c.Wait()
 		fmt.Printf("\n\n##############################################\n#    Connecting to %s, [%d/%d]\n##############################################\n\n\n", devices[di], di+1, len(devices))
-		go CmdToDevice(c, devices[di], optDebug, password, commands, *optPort)
+		go CmdToDevice(c, devices[di], optDebug, username, password, commands, *optPort)
 	}
 	c.WaitAllDone()
 }
