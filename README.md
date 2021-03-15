@@ -1,6 +1,11 @@
 # megaconf
 Utility for fast run list of commands to many network hardware (routers,switches, servers, etc)
 
+## Installation
+download binary from https://github.com/dsamsonov/megaconf/releases or git clone and compile this repositiry
+
+##Usage
+```bash
 Usage: megaconf [-?dprv] [-c value] [-h value] [-j value] [-l value] [-P value] [-t value] [-u value] [parameters ...]
  -?, --help         display help
  -c, --cmdlist=value
@@ -20,7 +25,7 @@ Usage: megaconf [-?dprv] [-c value] [-h value] [-j value] [-l value] [-P value] 
 
 by default output to console, if you want redirect output to file, use -l flag
 -r serves to protect against accidental startup. If you want run commands on your hardware, you need to specify this flag
-
+```
 format device file:
 <hostname1>
 <hostname2>
