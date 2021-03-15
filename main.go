@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"log"
 	"os"
+	"os/user"
 	"regexp"
 	"strconv"
 	"strings"
@@ -54,6 +55,7 @@ func main() {
 	var (
 		devices, commands []string
 		password          string
+		username          string
 	)
 	//parse command arguments
 	optHelp := getopt.BoolLong("help", '?', "display help")
@@ -61,6 +63,7 @@ func main() {
 	optDevFile := getopt.StringLong("hosts", 'h', "./devices.db", "File with devices list")
 	optCmdFile := getopt.StringLong("cmdlist", 'c', "./commands", "File with commands list")
 	optTimeout := getopt.StringLong("timeout", 't', "60", "Timeout in seconds")
+	optUsername := getopt.StringLong("username", 'u', "Username")
 	optPassword := getopt.BoolLong("password", 'p', "Promt for password")
 	optRun := getopt.BoolLong("run", 'r', "Run commands")
 	optDebug := getopt.BoolLong("debug", 'd', "Debug mode")
@@ -80,6 +83,17 @@ func main() {
 		getopt.Usage()
 		os.Exit(0)
 	}
+
+	if optUsername == nil {
+		currentUser, err := user.Current()
+		if err != nil {
+			log.Fatalf(err.Error())
+		}
+		username = currentUser.Username
+	} else {
+		username = *optUsername
+	}
+
 	//read files
 	devices = ReadFile(*optDevFile)
 	commands = ReadFile(*optCmdFile)
@@ -109,14 +123,15 @@ func main() {
 	for di := 0; di < len(devices); di++ {
 		c.Wait()
 		fmt.Printf("\n\n##############################################\n#    Connecting to %s, [%d/%d]\n##############################################\n\n\n", devices[di], di+1, len(devices))
-		zahuyarit(c, devices[di], optDebug, password, commands)
+		go connectAndSendCommands(c, devices[di], optDebug, username, password, commands)
 	}
 	c.WaitAllDone()
 }
 
-func zahuyarit(c goccm.ConcurrencyManager, device string, optDebug *bool, password string, commands []string) {
+func connectAndSendCommands(c goccm.ConcurrencyManager, device string, optDebug *bool, username string, password string, commands []string) {
 	defer c.Done()
-	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p 22 %s", device), -1, expect.Verbose(*optDebug))
+
+	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p 22 -l %s %s", username, device), -1, expect.Verbose(*optDebug), expect.VerboseWriter(os.Stdout))
 	if err != nil {
 		log.Printf("device %s, error: %s\n", device, err)
 		return
@@ -130,7 +145,6 @@ func zahuyarit(c goccm.ConcurrencyManager, device string, optDebug *bool, passwo
 		log.Printf("device %s, error: %s\n", device, err)
 		return
 	}
-	//e.Expect(promptRE, timeout)
 	// run commands
 	for i := 0; i < len(commands); i++ {
 		err = e.Send(commands[i] + "\n\r")
@@ -138,7 +152,11 @@ func zahuyarit(c goccm.ConcurrencyManager, device string, optDebug *bool, passwo
 			log.Printf("device %s, error while sending command \"%s\": %s\n", device, commands[i], err)
 			return
 		}
-		result, _, _ := e.Expect(promptRE, timeout)
+		result, _, err := e.Expect(promptRE, timeout)
+		if err != nil {
+			log.Printf("device %s, error after sending command \"%s\": %s\n", device, commands[i], err)
+			return
+		}
 		log.Printf("device %s, result: %s\n", device, result)
 	}
 }
