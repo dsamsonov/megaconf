@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	promptRE = regexp.MustCompile("(>|#|\\$|>\\s|])$")
+	promptRE = regexp.MustCompile("(>|#|#\\s|\\$|>\\s|])$")
 	passRE   = regexp.MustCompile("assword:")
 	timeout  time.Duration
 )
@@ -49,7 +49,7 @@ func ReadFile(file string) []string {
 
 func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, username, password string, commands []string, port int) {
 	defer c.Done()
-	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p %d -l %s %s", port,username, device), -1, expect.Verbose(*optDebug), expect.VerboseWriter(os.Stdout))
+	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p %d -l %s %s", port, username, device), -1, expect.Verbose(*optDebug), expect.VerboseWriter(os.Stdout))
 	if err != nil {
 		log.Printf("device %s, error: %s\n", device, err)
 		return
@@ -73,8 +73,8 @@ func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, user
 		}
 		result, _, err := e.Expect(promptRE, timeout)
 		if err != nil {
-		        log.Printf("device %s, error after sending command \"%s\": %s\n", device, commands[i], err)
-    			return
+			log.Printf("device %s, error after sending command \"%s\": %s\n", device, commands[i], err)
+			return
 		}
 		log.Printf("device %s, result: %s\n", device, result)
 	}
@@ -82,12 +82,12 @@ func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, user
 
 func main() {
 	const (
-		version = "0.0.2"
+		version = "0.0.3"
 	)
 
 	var (
-		devices, commands []string
-		username,password string
+		devices, commands  []string
+		username, password string
 	)
 
 	//parse command arguments
@@ -120,12 +120,12 @@ func main() {
 	if *optUsername == "" {
 		currentUser, err := user.Current()
 		if err != nil {
-		    Fatal(err)
+			Fatal(err)
 		}
-    		username = currentUser.Username
+		username = currentUser.Username
 	} else {
 		username = *optUsername
-        }
+	}
 	//read files
 	devices = ReadFile(*optDevFile)
 	commands = ReadFile(*optCmdFile)
