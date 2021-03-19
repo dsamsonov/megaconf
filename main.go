@@ -16,6 +16,10 @@ import (
 	"time"
 )
 
+const (
+	version = "0.0.4"
+)
+
 var (
 	promptRE = regexp.MustCompile("(>|#|#\\s|\\$|>\\s|])$")
 	passRE   = regexp.MustCompile("assword:")
@@ -71,6 +75,7 @@ func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, user
 			log.Printf("device %s, error while sending command \"%s\": %s\n", device, commands[i], err)
 			return
 		}
+		time.Sleep(1 * time.Second)
 		result, _, err := e.Expect(promptRE, timeout)
 		if err != nil {
 			log.Printf("device %s, error after sending command \"%s\": %s\n", device, commands[i], err)
@@ -81,10 +86,6 @@ func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, user
 }
 
 func main() {
-	const (
-		version = "0.0.3"
-	)
-
 	var (
 		devices, commands  []string
 		username, password string
