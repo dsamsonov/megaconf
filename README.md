@@ -1,43 +1,110 @@
-# megaconf
-Utility for fast run list of commands to many network hardware (routers,switches, servers, etc)
+# megaconf v2.0
+
+Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
 ## Installation
-download binary from https://github.com/dsamsonov/megaconf/releases or git clone and compile this repositiry
 
-##Usage
+Download binary from https://github.com/dsamsonov/megaconf/releases
+
+Or build from source:
 ```bash
-Usage: megaconf [-?dprv] [-c value] [-h value] [-j value] [-l value] [-P value] [-t value] [-u value] [parameters ...]
- -?, --help         display help
- -c, --cmdlist=value
-                    file with commands list [./commands]
- -d, --debug        debug mode
- -h, --hosts=value  file with devices list [./devices.db]
- -j, --jobs=value   number of parallel device jobs [1]
- -l, --log=value    Log file
- -p, --password     promt for password
- -P, --port=value   connect to port [22]
- -r, --run          run commands
- -t, --timeout=value
-                    timeout in seconds [60]
- -u, --username=value
-                    Username
- -v, --version      display version
-
-by default output to console, if you want redirect output to file, use -l flag
--r serves to protect against accidental startup. If you want run commands on your hardware, you need to specify this flag
-```
-```
-format device file:
-<hostname1>
-<hostname2>
-or:
-<ip addr1>
-<ip addr2>
-
-format commands file:
-cmd1
-cmd2
-cmd3
+make build
 ```
 
-Only ssh supported at this moment, if your need telnet or mikrotik-api, think deeply if you need it. And if necessary, then write to me about it
+## Usage
+
+```
+Usage: megaconf [-?drpvT] [-c value] [-C value] [-h value] [-j value] [-l value] [-P value] [-t value] [-u value]
+ -?, --help              display help
+ -v, --version           display version
+ -h, --hosts=value       file with devices list [./devices.db]
+ -c, --cmdlist=value     file with commands list (mutually exclusive with --cmd)
+ -C, --cmd=value         inline command, e.g. -C "sh ver" (mutually exclusive with --cmdlist)
+ -u, --username=value    username (default: current OS user)
+ -p, --password          prompt for password
+ -j, --jobs=value        number of parallel device jobs [1]
+ -t, --timeout=value     timeout in seconds for connect and commands [60]
+ -P, --port=value        port (default: 22 for SSH, 23 for Telnet)
+ -l, --log=value         log file (output goes to stdout AND log file)
+ -T, --telnet            use Telnet instead of SSH (default: SSH)
+ -r, --run               run commands (required)
+ -d, --debug             debug mode
+```
+
+## File formats
+
+**devices.db**
+```
+# Lines starting with # are ignored
+# One device per line: hostname or IP
+
+juniper1
+juniper2
+192.168.0.1
+192.168.0.2
+```
+
+**commands**
+```
+# Comments work here too
+sh version
+show chassis routing
+sh int description | no-more
+```
+
+## Examples
+
+```bash
+# Run commands via SSH (default)
+megaconf -r -u admin -p
+
+# Run commands via Telnet
+megaconf -r -u admin -p --telnet
+
+# Telnet on non-standard port
+megaconf -r -u admin -p --telnet -P 2023
+
+# Save output to log file (stdout is also printed)
+megaconf -r -u admin -p -l ./output.log
+
+# Inline command
+megaconf -r -u admin -p -C "sh ver"
+
+# Parallel execution on 10 devices at once
+megaconf -r -u admin -p -j 10
+
+# Custom hosts and commands files
+megaconf -r -u admin -p -h ./my_devices.db -c ./my_commands
+
+# Custom timeout
+megaconf -r -u admin -p -t 120
+```
+
+## Build
+
+```bash
+make build    # binary for current platform
+make all      # binaries for all platforms + tgz package
+make clean    # remove build artifacts
+```
+
+Supported platforms:
+
+| OS      | amd64 | 386 | arm64 | arm |
+|---------|-------|-----|-------|-----|
+| Linux   | ✓     | ✓   | ✓     | ✓   |
+| FreeBSD | ✓     | ✓   | ✓     |     |
+| macOS   | ✓     |     | ✓     |     |
+| Windows | ✓     | ✓   | ✓     |     |
+
+Binaries are statically linked — no dependencies required on target system.
+Windows binaries have `.exe` extension.
+
+## Notes
+
+- SSH is the default protocol; use `--telnet` / `-T` to switch
+- Telnet auth: username from `-u`, password from `-p` (same for all devices)
+- SSH config is read from `~/.ssh/config` as usual
+- `StrictHostKeyChecking=no` is intentional — network hardware keys change after firmware updates
+- One password for all devices by design — use SSH keys via `~/.ssh/config` for per-device auth
+- Output always goes to stdout; `-l` adds a log file in parallel

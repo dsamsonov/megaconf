@@ -1,5 +1,12 @@
+# Example devices.db
+# Lines starting with # are ignored
+# One device per line (hostname or IP)
+
+# JunOS routers
 juniper1
 juniper2
 juniper3
+
+# Core switches
 192.168.0.1
 192.168.0.2

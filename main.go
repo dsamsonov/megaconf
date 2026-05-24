@@ -3,108 +3,234 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/signal"
+	"os/user"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/google/goexpect"
 	"github.com/howeyc/gopass"
 	"github.com/pborman/getopt/v2"
 	"github.com/zenthangplus/goccm"
 	"google.golang.org/grpc/codes"
-	"log"
-	"os"
-	"os/user"
-	"regexp"
-	"strings"
-	"time"
 )
 
 const (
-	version = "1.0"
+	version            = "2.0"
+	defaultDevFile     = "./devices.db"
+	defaultCmdFile     = "./commands"
+	defaultTimeout     = 60
+	defaultSSHPort     = 22
+	defaultTelnetPort  = 23
+	defaultJobs        = 1
+	connectTimeout     = 15 * time.Second
+	retryDelay         = 5 * time.Second
+	retryCount         = 1
 )
 
 var (
-	promptRE = regexp.MustCompile("(>|#|#\\s|\\$|>\\s|])$")
-	passRE   = regexp.MustCompile("assword:")
-	timeout  time.Duration
+	// промпт покрывает все вендоры:
+	// - обычный:   hostname#  hostname>  router(config)#  user@host>  DGS-3120:admin#
+	// - Huawei:    <hostname>
+	// - MikroTik:  [admin@MikroTik] >
+	// исключает:  "via 1.2.3.4 >"  "[edit interfaces]"  JunOS diff строки
+	promptRE = regexp.MustCompile(`(?m)^[\w<\[][^\n]{0,62}(\][>\s]*[>#$]|[^\s][>#$])\s*$`)
+	passRE   = regexp.MustCompile(`(?i)assword:`)
+	loginRE  = regexp.MustCompile(`(?i)(login|username|user)\s*:`)
+	// пагинация — все популярные варианты
+	moreRE = regexp.MustCompile(`(?i)-+\s*more\s*-+|\[more [0-9]+%\]|<more>`)
+	// ANSI escape: все CSI sequences включая private mode (\x1B[?25l и т.д.)
+	ansiRE = regexp.MustCompile(`\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\x1B[()][AB012]`)
 )
 
-func Fatal(err error) {
-	fmt.Printf("\nERROR! %s\n\n", err)
+// Proto определяет протокол подключения
+type Proto int
+
+const (
+	ProtoSSH    Proto = iota
+	ProtoTelnet
+)
+
+// Config хранит всё что нужно для подключения и выполнения команд
+type Config struct {
+	Username string
+	Password string
+	Port     int
+	Proto    Proto
+	Debug    bool
+	Timeout  time.Duration
+	Commands []string
+}
+
+// Result итог работы по одному устройству
+type Result struct {
+	Device  string
+	Success bool
+	Reason  string
+	Output  string
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "\nERROR: %s\n\n", err)
 	os.Exit(1)
 }
 
-func ReadFile(file string) []string {
+// readLines читает файл, пропуская пустые строки и комментарии (#)
+func readLines(file string) ([]string, error) {
 	f, err := os.Open(file)
 	if err != nil {
-		Fatal(err)
+		return nil, err
 	}
 	defer f.Close()
-	out := make([]string, 0)
+
+	out := make([]string, 0, 64)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if len(line) != 0 {
-			out = append(out, line)
+		if len(line) == 0 || strings.HasPrefix(line, "#") {
+			continue
 		}
+		out = append(out, line)
 	}
-	if err := scanner.Err(); err != nil {
-		Fatal(err)
-	}
-	return out
+	return out, scanner.Err()
 }
 
-func CmdToDevice(c goccm.ConcurrencyManager, device string, optDebug *bool, username, password string, commands []string, port int) {
-	defer c.Done()
-	e, _, err := expect.Spawn(fmt.Sprintf("ssh -o StricthostKeyChecking=no -o CheckHostIP=no -p %d -l %s %s", port, username, device), -1, expect.Verbose(*optDebug), expect.VerboseWriter(os.Stdout))
+// stripANSI удаляет ANSI escape-коды из строки
+func stripANSI(s string) string {
+	return ansiRE.ReplaceAllString(s, "")
+}
+
+// spawnCmd возвращает строку запуска в зависимости от протокола
+func spawnCmd(cfg Config, device string) string {
+	switch cfg.Proto {
+	case ProtoTelnet:
+		return fmt.Sprintf("telnet %s %d", device, cfg.Port)
+	default:
+		return fmt.Sprintf(
+			"ssh -o StrictHostKeyChecking=no -o CheckHostIP=no -o ConnectTimeout=%d -p %d -l %s %s",
+			int(connectTimeout.Seconds()), cfg.Port, cfg.Username, device,
+		)
+	}
+}
+
+// connectAndRun выполняет команды на одном устройстве, возвращает буферизованный вывод
+func connectAndRun(device string, cfg Config) (string, error) {
+	e, _, err := expect.Spawn(
+		spawnCmd(cfg, device),
+		connectTimeout,
+		expect.Verbose(cfg.Debug),
+		expect.VerboseWriter(os.Stderr),
+	)
 	if err != nil {
-		log.Printf("device %s, error: %s\n", device, err)
-		return
+		return "", fmt.Errorf("spawn: %w", err)
 	}
 	defer e.Close()
+
+	// логин: для telnet нужно пройти login: → username, Password: → password
+	// для ssh обычно сразу промпт (ключи) или только Password:
+	if cfg.Proto == ProtoTelnet {
+		// ждём login prompt
+		_, _, _, err = e.ExpectSwitchCase([]expect.Caser{
+			&expect.Case{R: loginRE, T: expect.OK()},
+			// некоторые устройства сразу дают промпт без логина
+			&expect.Case{R: promptRE, T: expect.OK()},
+		}, cfg.Timeout)
+		if err != nil {
+			return "", fmt.Errorf("telnet login prompt: %w", err)
+		}
+		// отправляем username если поймали login:
+		if err = e.Send(cfg.Username + "\r\n"); err != nil {
+			return "", fmt.Errorf("telnet send username: %w", err)
+		}
+	}
+
+	// ждём пароль или промпт (общее для SSH и Telnet)
 	_, _, _, err = e.ExpectSwitchCase([]expect.Caser{
-		&expect.Case{R: passRE, S: password + "\n", T: expect.Continue(expect.NewStatus(codes.PermissionDenied, "Access denied, wrong password")), Rt: 2},
+		&expect.Case{
+			R:  passRE,
+			S:  cfg.Password + "\r\n",
+			T:  expect.Continue(expect.NewStatus(codes.PermissionDenied, "wrong password")),
+			Rt: 2,
+		},
 		&expect.Case{R: promptRE, T: expect.OK()},
-	}, timeout)
+	}, cfg.Timeout)
 	if err != nil {
-		log.Printf("device %s, error: %s\n", device, err)
+		return "", fmt.Errorf("login: %w", err)
+	}
+
+	var buf strings.Builder
+
+	for _, cmd := range cfg.Commands {
+		if err := e.Send(cmd + "\r\n"); err != nil {
+			return buf.String(), fmt.Errorf("send %q: %w", cmd, err)
+		}
+
+		// ждём промпт, обрабатывая пагинацию
+		for {
+			result, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
+				&expect.Case{R: moreRE, S: " ", T: expect.Continue(expect.NewStatus(codes.OK, "more"))},
+				&expect.Case{R: promptRE, T: expect.OK()},
+			}, cfg.Timeout)
+			if matchErr != nil {
+				return buf.String(), fmt.Errorf("expect after %q: %w", cmd, matchErr)
+			}
+			buf.WriteString(stripANSI(result))
+			if promptRE.MatchString(result) {
+				break
+			}
+		}
+	}
+
+	return buf.String(), nil
+}
+
+// runDevice выполняет connectAndRun с одним retry и пишет результат в канал
+func runDevice(device string, cfg Config, results chan<- Result) {
+	var (
+		output string
+		err    error
+	)
+
+	for attempt := 0; attempt <= retryCount; attempt++ {
+		if attempt > 0 {
+			time.Sleep(retryDelay)
+		}
+		output, err = connectAndRun(device, cfg)
+		if err == nil {
+			break
+		}
+	}
+
+	if err != nil {
+		results <- Result{Device: device, Success: false, Reason: err.Error()}
 		return
 	}
-	//e.Expect(promptRE, timeout)
-	// run commands
-	for i := 0; i < len(commands); i++ {
-		err = e.Send(commands[i] + "\n\r")
-		if err != nil {
-			log.Printf("device %s, error while sending command \"%s\": %s\n", device, commands[i], err)
-			return
-		}
-		time.Sleep(1 * time.Second)
-		result, _, err := e.Expect(promptRE, timeout)
-		if err != nil {
-			log.Printf("device %s, error after sending command \"%s\": %s\n", device, commands[i], err)
-			return
-		}
-		log.Printf("device %s, result: %s\n", device, result)
-	}
+	results <- Result{Device: device, Success: true, Output: output}
 }
 
 func main() {
-	var (
-		devices, commands  []string
-		username, password string
-	)
-
-	//parse command arguments
-	optHelp := getopt.BoolLong("help", '?', "display help")
+	optHelp    := getopt.BoolLong("help", '?', "display help")
 	optVersion := getopt.BoolLong("version", 'v', "display version")
-	optDevFile := getopt.StringLong("hosts", 'h', "./devices.db", "file with devices list")
-	optCmdFile := getopt.StringLong("cmdlist", 'c', "./commands", "file with commands list")
-	optUsername := getopt.StringLong("username", 'u', "", "Username")
-	optJobs := getopt.IntLong("jobs", 'j', 1, "number of parallel device jobs")
-	optTimeout := getopt.IntLong("timeout", 't', 60, "timeout in seconds")
-	optPort := getopt.IntLong("port", 'P', 22, "connect to port")
-	optPassword := getopt.BoolLong("password", 'p', "promt for password")
-	optRun := getopt.BoolLong("run", 'r', "run commands")
-	optDebug := getopt.BoolLong("debug", 'd', "debug mode")
-	optLogFile := getopt.StringLong("log", 'l', "", "Log file")
+	optDevFile := getopt.StringLong("hosts", 'h', defaultDevFile, "file with devices list")
+	optCmdFile := getopt.StringLong("cmdlist", 'c', "", "file with commands list (mutually exclusive with --cmd)")
+	optCmd     := getopt.StringLong("cmd", 'C', "", "inline command (mutually exclusive with --cmdlist)")
+	optUsername := getopt.StringLong("username", 'u', "", "username")
+	optJobs    := getopt.IntLong("jobs", 'j', defaultJobs, "number of parallel jobs")
+	optTimeout := getopt.IntLong("timeout", 't', defaultTimeout, "timeout in seconds (connect + command)")
+	optPort    := getopt.IntLong("port", 'P', 0, "port (default: 22 for SSH, 23 for Telnet)")
+	optPassword := getopt.BoolLong("password", 'p', "prompt for password")
+	optRun     := getopt.BoolLong("run", 'r', "run commands (required)")
+	optDebug   := getopt.BoolLong("debug", 'd', "debug mode")
+	optLogFile := getopt.StringLong("log", 'l', "", "log file (output goes to stdout AND log file)")
+	optTelnet  := getopt.BoolLong("telnet", 'T', "use Telnet instead of SSH")
 	getopt.Parse()
+
 	if *optHelp {
 		getopt.Usage()
 		os.Exit(0)
@@ -113,53 +239,166 @@ func main() {
 		fmt.Println(version)
 		os.Exit(0)
 	}
-	if *optRun != true {
-		fmt.Println("\nIf you want to run commands on devices, use flag -r\n")
+	if !*optRun {
+		fmt.Println("\nUse -r flag to actually run commands on devices.\n")
 		getopt.Usage()
 		os.Exit(0)
 	}
-	if *optUsername == "" {
-		currentUser, err := user.Current()
-		if err != nil {
-			Fatal(err)
-		}
-		username = currentUser.Username
-	} else {
-		username = *optUsername
+	if *optCmd != "" && *optCmdFile != "" {
+		fatal(fmt.Errorf("--cmd and --cmdlist are mutually exclusive"))
 	}
-	//read files
-	devices = ReadFile(*optDevFile)
-	commands = ReadFile(*optCmdFile)
+
+	// определяем протокол и порт
+	proto := ProtoSSH
+	port := defaultSSHPort
+	if *optTelnet {
+		proto = ProtoTelnet
+		port = defaultTelnetPort
+	}
+	if *optPort != 0 {
+		port = *optPort
+	}
+
+	// определяем username
+	username := *optUsername
+	if username == "" {
+		u, err := user.Current()
+		if err != nil {
+			fatal(err)
+		}
+		username = u.Username
+	}
+
+	// читаем устройства
+	devices, err := readLines(*optDevFile)
+	if err != nil {
+		fatal(fmt.Errorf("devices file: %w", err))
+	}
 	if len(devices) == 0 {
-		Fatal(fmt.Errorf("file %s dont be empty", *optDevFile))
+		fatal(fmt.Errorf("devices file %s is empty", *optDevFile))
+	}
+
+	// читаем команды
+	var commands []string
+	switch {
+	case *optCmd != "":
+		commands = []string{*optCmd}
+	case *optCmdFile != "":
+		commands, err = readLines(*optCmdFile)
+		if err != nil {
+			fatal(fmt.Errorf("commands file: %w", err))
+		}
+	default:
+		commands, err = readLines(defaultCmdFile)
+		if err != nil {
+			fatal(fmt.Errorf("commands file: %w", err))
+		}
 	}
 	if len(commands) == 0 {
-		Fatal(fmt.Errorf("file %s dont be empty", *optCmdFile))
+		fatal(fmt.Errorf("commands list is empty"))
 	}
-	if *optPassword == true {
+
+	// пароль
+	var password string
+	if *optPassword {
 		fmt.Printf("Enter password: ")
 		p, err := gopass.GetPasswd()
 		if err != nil {
-			Fatal(err)
+			fatal(err)
 		}
 		password = string(p)
 	}
-	timeout = time.Duration(*optTimeout) * time.Second
+
+	cfg := Config{
+		Username: username,
+		Password: password,
+		Port:     port,
+		Proto:    proto,
+		Debug:    *optDebug,
+		Timeout:  time.Duration(*optTimeout) * time.Second,
+		Commands: commands,
+	}
+
+	// настраиваем вывод: stdout всегда, файл опционально
+	out := io.Writer(os.Stdout)
 	if *optLogFile != "" {
 		lf, err := os.Create(*optLogFile)
 		if err != nil {
-			Fatal(err)
+			fatal(fmt.Errorf("log file: %w", err))
 		}
-		log.SetOutput(lf)
 		defer lf.Close()
+		out = io.MultiWriter(os.Stdout, lf)
+		log.SetOutput(lf)
 	}
-	// connect to devices
-	c := goccm.New(*optJobs)
 
-	for di := 0; di < len(devices); di++ {
+	// канал результатов и WaitGroup для сборщика
+	resultsCh := make(chan Result, len(devices))
+	var collectorWg sync.WaitGroup
+	collectorWg.Add(1)
+
+	var (
+		mu        sync.Mutex
+		successes []Result
+		failures  []Result
+	)
+
+	// горутина-сборщик результатов
+	go func() {
+		defer collectorWg.Done()
+		for r := range resultsCh {
+			fmt.Fprintf(out, "\n##############################################\n")
+			fmt.Fprintf(out, "# Device: %s\n", r.Device)
+			fmt.Fprintf(out, "##############################################\n")
+			if r.Success {
+				fmt.Fprint(out, r.Output)
+			} else {
+				fmt.Fprintf(out, "ERROR: %s\n", r.Reason)
+			}
+
+			mu.Lock()
+			if r.Success {
+				successes = append(successes, r)
+			} else {
+				failures = append(failures, r)
+			}
+			mu.Unlock()
+		}
+	}()
+
+	// обработка Ctrl+C
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Fprintln(out, "\n\nInterrupted.")
+		os.Exit(130)
+	}()
+
+	// запускаем задачи
+	c := goccm.New(*optJobs)
+	for _, device := range devices {
 		c.Wait()
-		fmt.Printf("\n\n##############################################\n#    Connecting to %s, [%d/%d]\n##############################################\n\n\n", devices[di], di+1, len(devices))
-		go CmdToDevice(c, devices[di], optDebug, username, password, commands, *optPort)
+		d := device
+		go func() {
+			defer c.Done()
+			runDevice(d, cfg, resultsCh)
+		}()
 	}
 	c.WaitAllDone()
+	close(resultsCh)
+	collectorWg.Wait()
+
+	// итоговый отчёт
+	fmt.Fprintf(out, "\n\n==============================================\n")
+	fmt.Fprintf(out, "SUMMARY\n")
+	fmt.Fprintf(out, "==============================================\n")
+	fmt.Fprintf(out, "Success: %d\n", len(successes))
+	for _, r := range successes {
+		fmt.Fprintf(out, "  + %s\n", r.Device)
+	}
+	fmt.Fprintf(out, "\nUnsuccessful: %d\n", len(failures))
+	for _, r := range failures {
+		fmt.Fprintf(out, "  - %s  (%s)\n", r.Device, r.Reason)
+	}
+	fmt.Fprintln(out)
 }
