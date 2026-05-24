@@ -173,7 +173,7 @@ func connectAndRun(device string, cfg Config) (string, error) {
 
 		// ждём промпт, обрабатывая пагинацию
 		for {
-			result, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
+			result, _, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
 				&expect.Case{R: moreRE, S: " ", T: expect.Continue(expect.NewStatus(codes.OK, "more"))},
 				&expect.Case{R: promptRE, T: expect.OK()},
 			}, cfg.Timeout)
