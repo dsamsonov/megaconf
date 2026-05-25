@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/signal"
 	"os/user"
@@ -22,30 +21,27 @@ import (
 )
 
 const (
-	version            = "2.0"
-	defaultDevFile     = "./devices.db"
-	defaultCmdFile     = "./commands"
-	defaultTimeout     = 60
-	defaultSSHPort     = 22
-	defaultTelnetPort  = 23
-	defaultJobs        = 1
-	connectTimeout     = 15 * time.Second
-	retryDelay         = 5 * time.Second
-	retryCount         = 1
+	version           = "2.0"
+	defaultDevFile    = "./devices.db"
+	defaultCmdFile    = "./commands"
+	defaultTimeout    = 60
+	defaultSSHPort    = 22
+	defaultTelnetPort = 23
+	defaultJobs       = 1
+	connectTimeout    = 15 * time.Second
+	retryDelay        = 5 * time.Second
+	retryCount        = 1
 )
 
 var (
-	// промпт покрывает все вендоры:
-	// - обычный:   hostname#  hostname>  router(config)#  user@host>  DGS-3120:admin#
-	// - Huawei:    <hostname>
-	// - MikroTik:  [admin@MikroTik] >
-	// исключает:  "via 1.2.3.4 >"  "[edit interfaces]"  JunOS diff строки
+	// универсальный промпт — покрывает Cisco/JunOS/Huawei/MikroTik/Eltex/D-Link
+	// исключает JunOS diff строки и маршруты вида "via 1.2.3.4 >"
 	promptRE = regexp.MustCompile(`(?m)^[\w<\[][^\n]{0,62}(\][>\s]*[>#$]|[^\s][>#$])\s*$`)
 	passRE   = regexp.MustCompile(`(?i)assword:`)
-	loginRE  = regexp.MustCompile(`(?i)(login|username|user)\s*:`)
+	loginRE  = regexp.MustCompile(`(?im)(login|username|user)\s*:\s*$`)
 	// пагинация — все популярные варианты
 	moreRE = regexp.MustCompile(`(?i)-+\s*more\s*-+|\[more [0-9]+%\]|<more>`)
-	// ANSI escape: все CSI sequences включая private mode (\x1B[?25l и т.д.)
+	// ANSI escape коды (MikroTik и другие)
 	ansiRE = regexp.MustCompile(`\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\x1B[()][AB012]`)
 )
 
@@ -119,7 +115,7 @@ func spawnCmd(cfg Config, device string) string {
 	}
 }
 
-// connectAndRun выполняет команды на одном устройстве, возвращает буферизованный вывод
+// connectAndRun подключается к устройству и выполняет команды
 func connectAndRun(device string, cfg Config) (string, error) {
 	e, _, err := expect.Spawn(
 		spawnCmd(cfg, device),
@@ -132,25 +128,26 @@ func connectAndRun(device string, cfg Config) (string, error) {
 	}
 	defer e.Close()
 
-	// логин: для telnet нужно пройти login: → username, Password: → password
-	// для ssh обычно сразу промпт (ключи) или только Password:
+	// для telnet: login → username → password → prompt
+	// для ssh: сразу prompt или password
 	if cfg.Proto == ProtoTelnet {
-		// ждём login prompt
-		_, _, _, err = e.ExpectSwitchCase([]expect.Caser{
+		_, _, idx, err := e.ExpectSwitchCase([]expect.Caser{
 			&expect.Case{R: loginRE, T: expect.OK()},
-			// некоторые устройства сразу дают промпт без логина
 			&expect.Case{R: promptRE, T: expect.OK()},
 		}, cfg.Timeout)
 		if err != nil {
 			return "", fmt.Errorf("telnet login prompt: %w", err)
 		}
-		// отправляем username если поймали login:
-		if err = e.Send(cfg.Username + "\r\n"); err != nil {
-			return "", fmt.Errorf("telnet send username: %w", err)
+		// отправляем username только если поймали loginRE (idx=0)
+		// idx=1 означает устройство сразу дало промпт — username не нужен
+		if idx == 0 {
+			if err = e.Send(cfg.Username + "\r\n"); err != nil {
+				return "", fmt.Errorf("telnet send username: %w", err)
+			}
 		}
 	}
 
-	// ждём пароль или промпт (общее для SSH и Telnet)
+	// ждём пароль или промпт
 	_, _, _, err = e.ExpectSwitchCase([]expect.Caser{
 		&expect.Case{
 			R:  passRE,
@@ -170,8 +167,7 @@ func connectAndRun(device string, cfg Config) (string, error) {
 		if err := e.Send(cmd + "\r\n"); err != nil {
 			return buf.String(), fmt.Errorf("send %q: %w", cmd, err)
 		}
-
-		// ждём промпт, обрабатывая пагинацию
+		// ждём промпт обрабатывая пагинацию
 		for {
 			result, _, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
 				&expect.Case{R: moreRE, S: " ", T: expect.Continue(expect.NewStatus(codes.OK, "more"))},
@@ -196,7 +192,6 @@ func runDevice(device string, cfg Config, results chan<- Result) {
 		output string
 		err    error
 	)
-
 	for attempt := 0; attempt <= retryCount; attempt++ {
 		if attempt > 0 {
 			time.Sleep(retryDelay)
@@ -206,7 +201,6 @@ func runDevice(device string, cfg Config, results chan<- Result) {
 			break
 		}
 	}
-
 	if err != nil {
 		results <- Result{Device: device, Success: false, Reason: err.Error()}
 		return
@@ -215,20 +209,20 @@ func runDevice(device string, cfg Config, results chan<- Result) {
 }
 
 func main() {
-	optHelp    := getopt.BoolLong("help", '?', "display help")
-	optVersion := getopt.BoolLong("version", 'v', "display version")
-	optDevFile := getopt.StringLong("hosts", 'h', defaultDevFile, "file with devices list")
-	optCmdFile := getopt.StringLong("cmdlist", 'c', "", "file with commands list (mutually exclusive with --cmd)")
-	optCmd     := getopt.StringLong("cmd", 'C', "", "inline command (mutually exclusive with --cmdlist)")
+	optHelp     := getopt.BoolLong("help", '?', "display help")
+	optVersion  := getopt.BoolLong("version", 'v', "display version")
+	optDevFile  := getopt.StringLong("hosts", 'h', defaultDevFile, "file with devices list")
+	optCmdFile  := getopt.StringLong("cmdlist", 'c', "", "file with commands list (mutually exclusive with --cmd)")
+	optCmd      := getopt.StringLong("cmd", 'C', "", "inline command (mutually exclusive with --cmdlist)")
 	optUsername := getopt.StringLong("username", 'u', "", "username")
-	optJobs    := getopt.IntLong("jobs", 'j', defaultJobs, "number of parallel jobs")
-	optTimeout := getopt.IntLong("timeout", 't', defaultTimeout, "timeout in seconds (connect + command)")
-	optPort    := getopt.IntLong("port", 'P', 0, "port (default: 22 for SSH, 23 for Telnet)")
+	optJobs     := getopt.IntLong("jobs", 'j', defaultJobs, "number of parallel jobs")
+	optTimeout  := getopt.IntLong("timeout", 't', defaultTimeout, "timeout in seconds (connect + command)")
+	optPort     := getopt.IntLong("port", 'P', 0, "port (default: 22 for SSH, 23 for Telnet)")
 	optPassword := getopt.BoolLong("password", 'p', "prompt for password")
-	optRun     := getopt.BoolLong("run", 'r', "run commands (required)")
-	optDebug   := getopt.BoolLong("debug", 'd', "debug mode")
-	optLogFile := getopt.StringLong("log", 'l', "", "log file (output goes to stdout AND log file)")
-	optTelnet  := getopt.BoolLong("telnet", 'T', "use Telnet instead of SSH")
+	optRun      := getopt.BoolLong("run", 'r', "run commands (required)")
+	optDebug    := getopt.BoolLong("debug", 'd', "debug mode")
+	optLogFile  := getopt.StringLong("log", 'l', "", "log file (output goes to stdout AND log file)")
+	optTelnet   := getopt.BoolLong("telnet", 'T', "use Telnet instead of SSH (default: SSH)")
 	getopt.Parse()
 
 	if *optHelp {
@@ -248,7 +242,7 @@ func main() {
 		fatal(fmt.Errorf("--cmd and --cmdlist are mutually exclusive"))
 	}
 
-	// определяем протокол и порт
+	// протокол и порт
 	proto := ProtoSSH
 	port := defaultSSHPort
 	if *optTelnet {
@@ -259,7 +253,7 @@ func main() {
 		port = *optPort
 	}
 
-	// определяем username
+	// username
 	username := *optUsername
 	if username == "" {
 		u, err := user.Current()
@@ -319,7 +313,7 @@ func main() {
 		Commands: commands,
 	}
 
-	// настраиваем вывод: stdout всегда, файл опционально
+	// вывод: stdout + опциональный файл
 	out := io.Writer(os.Stdout)
 	if *optLogFile != "" {
 		lf, err := os.Create(*optLogFile)
@@ -328,21 +322,16 @@ func main() {
 		}
 		defer lf.Close()
 		out = io.MultiWriter(os.Stdout, lf)
-		log.SetOutput(lf)
 	}
 
-	// канал результатов и WaitGroup для сборщика
+	// канал результатов
 	resultsCh := make(chan Result, len(devices))
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
 
-	var (
-		mu        sync.Mutex
-		successes []Result
-		failures  []Result
-	)
+	var successes, failures []Result
 
-	// горутина-сборщик результатов
+	// горутина-сборщик — единственный читатель resultsCh, блокировка не нужна
 	go func() {
 		defer collectorWg.Done()
 		for r := range resultsCh {
@@ -351,21 +340,15 @@ func main() {
 			fmt.Fprintf(out, "##############################################\n")
 			if r.Success {
 				fmt.Fprint(out, r.Output)
-			} else {
-				fmt.Fprintf(out, "ERROR: %s\n", r.Reason)
-			}
-
-			mu.Lock()
-			if r.Success {
 				successes = append(successes, r)
 			} else {
+				fmt.Fprintf(out, "ERROR: %s\n", r.Reason)
 				failures = append(failures, r)
 			}
-			mu.Unlock()
 		}
 	}()
 
-	// обработка Ctrl+C
+	// Ctrl+C — обрываем всё сразу
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -392,7 +375,7 @@ func main() {
 	fmt.Fprintf(out, "\n\n==============================================\n")
 	fmt.Fprintf(out, "SUMMARY\n")
 	fmt.Fprintf(out, "==============================================\n")
-	fmt.Fprintf(out, "Success: %d\n", len(successes))
+	fmt.Fprintf(out, "Success:      %d\n", len(successes))
 	for _, r := range successes {
 		fmt.Fprintf(out, "  + %s\n", r.Device)
 	}

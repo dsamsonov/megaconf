@@ -8,6 +8,7 @@ Download binary from https://github.com/dsamsonov/megaconf/releases
 
 Or build from source:
 ```bash
+go mod tidy
 make build
 ```
 
@@ -23,7 +24,7 @@ Usage: megaconf [-?drpvT] [-c value] [-C value] [-h value] [-j value] [-l value]
  -u, --username=value    username (default: current OS user)
  -p, --password          prompt for password
  -j, --jobs=value        number of parallel device jobs [1]
- -t, --timeout=value     timeout in seconds for connect and commands [60]
+ -t, --timeout=value     timeout in seconds (connect + command) [60]
  -P, --port=value        port (default: 22 for SSH, 23 for Telnet)
  -l, --log=value         log file (output goes to stdout AND log file)
  -T, --telnet            use Telnet instead of SSH (default: SSH)
@@ -38,8 +39,11 @@ Usage: megaconf [-?drpvT] [-c value] [-C value] [-h value] [-j value] [-l value]
 # Lines starting with # are ignored
 # One device per line: hostname or IP
 
+# JunOS routers
 juniper1
 juniper2
+
+# Core switches
 192.168.0.1
 192.168.0.2
 ```
@@ -90,21 +94,31 @@ make clean    # remove build artifacts
 
 Supported platforms:
 
-| OS      | amd64 | 386 | arm64 | arm |
-|---------|-------|-----|-------|-----|
-| Linux   | ✓     | ✓   | ✓     | ✓   |
-| FreeBSD | ✓     | ✓   | ✓     |     |
-| macOS   | ✓     |     | ✓     |     |
-| Windows | ✓     | ✓   | ✓     |     |
+| OS    | amd64 | 386 | arm64 | arm |
+|-------|-------|-----|-------|-----|
+| Linux | ✓     | ✓   | ✓     | ✓   |
+| macOS | ✓     |     | ✓     |     |
 
 Binaries are statically linked — no dependencies required on target system.
-Windows binaries have `.exe` extension.
+
+## SSH
+
+- Uses system `ssh` binary — all `~/.ssh/config` settings apply automatically
+- SSH agent forwarding via `SSH_AUTH_SOCK`
+- Password auth via `-p` as fallback
+- `StrictHostKeyChecking=no` — intentional, network hardware keys change after firmware updates
+
+## Telnet
+
+- Uses system `telnet` binary
+- Username from `-u`, password from `-p`
+- Same credentials for all devices
 
 ## Notes
 
-- SSH is the default protocol; use `--telnet` / `-T` to switch
-- Telnet auth: username from `-u`, password from `-p` (same for all devices)
-- SSH config is read from `~/.ssh/config` as usual
-- `StrictHostKeyChecking=no` is intentional — network hardware keys change after firmware updates
-- One password for all devices by design — use SSH keys via `~/.ssh/config` for per-device auth
+- One password for all devices by design
 - Output always goes to stdout; `-l` adds a log file in parallel
+- On Ctrl+C all active sessions are aborted immediately
+- Failed devices appear in Unsuccessful section with reason
+- Pagination (`---- More ----`, `[more 50%]`, `<more>`) handled automatically
+- ANSI escape codes stripped from output (MikroTik etc.)
