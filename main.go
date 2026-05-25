@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	version           = "2.0"
+	version           = "2.1"
 	defaultDevFile    = "./devices.db"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
@@ -159,6 +159,15 @@ func connectAndRun(device string, cfg Config) (string, error) {
 	}, cfg.Timeout)
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)
+	}
+
+	// отправляем пустую строку чтобы получить свежий промпт
+	// и гарантированно сбросить буфер после логина/MOTD
+	if err = e.Send("\r\n"); err != nil {
+		return "", fmt.Errorf("send empty: %w", err)
+	}
+	if _, _, err = e.Expect(promptRE, cfg.Timeout); err != nil {
+		return "", fmt.Errorf("prompt after login: %w", err)
 	}
 
 	var buf strings.Builder
@@ -358,10 +367,15 @@ func main() {
 	}()
 
 	// запускаем задачи
+	total := len(devices)
 	c := goccm.New(*optJobs)
-	for _, device := range devices {
+	for i, device := range devices {
 		c.Wait()
 		d := device
+		n := i + 1
+		fmt.Fprintf(out, "\n##############################################\n")
+		fmt.Fprintf(out, "#    Connecting to %s, [%d/%d]\n", d, n, total)
+		fmt.Fprintf(out, "##############################################\n\n")
 		go func() {
 			defer c.Done()
 			runDevice(d, cfg, resultsCh)
