@@ -2,22 +2,24 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/google/goexpect"
 	"github.com/howeyc/gopass"
 	"github.com/pborman/getopt/v2"
 	"github.com/zenthangplus/goccm"
-	"google.golang.org/grpc/codes"
 )
 
 const (
@@ -28,9 +30,10 @@ const (
 	defaultSSHPort    = 22
 	defaultTelnetPort = 23
 	defaultJobs       = 1
-	connectTimeout    = 15 * time.Second
+	connectTimeout    = 15
 	retryDelay        = 5 * time.Second
 	retryCount        = 1
+	pollInterval      = 50 * time.Millisecond
 )
 
 var (
@@ -39,10 +42,13 @@ var (
 	promptRE = regexp.MustCompile(`(?m)^[\w<\[][^\n]{0,62}(\][>\s]*[>#$]|[^\s][>#$])\s*$`)
 	passRE   = regexp.MustCompile(`(?i)assword:`)
 	loginRE  = regexp.MustCompile(`(?im)(login|username|user)\s*:\s*$`)
-	// пагинация — все популярные варианты
-	moreRE = regexp.MustCompile(`(?i)-+\s*more\s*-+|\[more [0-9]+%\]|<more>`)
+	// пагинация — все популярные варианты включая JunOS ---(more)---
+	moreRE = regexp.MustCompile(`(?i)-+\s*\(?\s*more\s*\)?\s*-+|\[more [0-9]+%\]|<more>`)
 	// ANSI escape коды (MikroTik и другие)
 	ansiRE = regexp.MustCompile(`\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\x1B[()][AB012]`)
+
+	// путь к ssh бинарю — вычисляется один раз при старте
+	sshBin = findSSHBinary()
 )
 
 // Proto определяет протокол подключения
@@ -70,6 +76,89 @@ type Result struct {
 	Success bool
 	Reason  string
 	Output  string
+}
+
+// Expecter простая реализация expect поверх io.Reader/io.Writer
+// с полным контролем над буфером
+type Expecter struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	w     io.Writer
+	debug bool
+}
+
+// newExpecter создаёт Expecter и запускает фоновое чтение из r
+func newExpecter(r io.Reader, w io.Writer, debug bool) *Expecter {
+	e := &Expecter{w: w, debug: debug}
+	go func() {
+		b := make([]byte, 4096)
+		for {
+			n, err := r.Read(b)
+			if n > 0 {
+				e.mu.Lock()
+				e.buf.Write(b[:n])
+				e.mu.Unlock()
+				if debug {
+					os.Stderr.Write(b[:n])
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return e
+}
+
+// Send отправляет строку в процесс
+func (e *Expecter) Send(s string) error {
+	if e.debug {
+		fmt.Fprintf(os.Stderr, "Sent: %q\n", s)
+	}
+	_, err := fmt.Fprint(e.w, s)
+	return err
+}
+
+// ExpectSwitchCase ждёт совпадения одного из паттернов.
+// Возвращает совпавший текст, индекс паттерна и ошибку.
+// После матча совпавшая часть удаляется из буфера.
+func (e *Expecter) ExpectSwitchCase(patterns []*regexp.Regexp, timeout time.Duration) (string, int, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		e.mu.Lock()
+		data := e.buf.String()
+		matched := ""
+		idx := -1
+		for i, re := range patterns {
+			loc := re.FindStringIndex(data)
+			if loc == nil {
+				continue
+			}
+			matched = data[:loc[1]]
+			idx = i
+			e.buf.Next(loc[1]) // удаляем совпавшую часть, остаток остаётся
+			break
+		}
+		e.mu.Unlock()
+
+		if idx >= 0 {
+			if e.debug {
+				fmt.Fprintf(os.Stderr, "Match for RE: %q found\n", patterns[idx].String())
+			}
+			return matched, idx, nil
+		}
+		time.Sleep(pollInterval)
+	}
+	e.mu.Lock()
+	data := e.buf.String()
+	e.mu.Unlock()
+	return data, -1, fmt.Errorf("timeout after %s", timeout)
+}
+
+// Expect ждёт совпадения одного паттерна
+func (e *Expecter) Expect(re *regexp.Regexp, timeout time.Duration) (string, error) {
+	text, _, err := e.ExpectSwitchCase([]*regexp.Regexp{re}, timeout)
+	return text, err
 }
 
 func fatal(err error) {
@@ -102,64 +191,96 @@ func stripANSI(s string) string {
 	return ansiRE.ReplaceAllString(s, "")
 }
 
-// spawnCmd возвращает строку запуска в зависимости от протокола
-func spawnCmd(cfg Config, device string) string {
+// findSSHBinary возвращает путь к ssh бинарю
+func findSSHBinary() string {
+	if runtime.GOOS == "windows" {
+		for _, p := range []string{
+			`C:\Windows\System32\OpenSSH\ssh.exe`,
+			`C:\Program Files\OpenSSH\ssh.exe`,
+			`C:\Program Files (x86)\OpenSSH\ssh.exe`,
+		} {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return "ssh"
+}
+
+// buildCmd строит exec.Cmd для SSH или Telnet
+func buildCmd(cfg Config, device string) *exec.Cmd {
 	switch cfg.Proto {
 	case ProtoTelnet:
-		return fmt.Sprintf("telnet %s %d", device, cfg.Port)
+		return exec.Command("telnet", device, strconv.Itoa(cfg.Port))
 	default:
-		return fmt.Sprintf(
-			"ssh -o StrictHostKeyChecking=no -o CheckHostIP=no -o ConnectTimeout=%d -p %d -l %s %s",
-			int(connectTimeout.Seconds()), cfg.Port, cfg.Username, device,
+		return exec.Command(sshBin,
+			"-tt",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "CheckHostIP=no",
+			"-o", "ConnectTimeout="+strconv.Itoa(connectTimeout),
+			"-p", strconv.Itoa(cfg.Port),
+			"-l", cfg.Username,
+			device,
 		)
 	}
 }
 
 // connectAndRun подключается к устройству и выполняет команды
 func connectAndRun(device string, cfg Config) (string, error) {
-	e, _, err := expect.Spawn(
-		spawnCmd(cfg, device),
-		connectTimeout,
-		expect.Verbose(cfg.Debug),
-		expect.VerboseWriter(os.Stderr),
-		expect.PartialMatch(true),
-	)
+	cmd := buildCmd(cfg, device)
+
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return "", fmt.Errorf("spawn: %w", err)
+		return "", fmt.Errorf("stdin pipe: %w", err)
 	}
-	defer e.Close()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start: %w", err)
+	}
+	defer func() {
+		stdin.Close()
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	go io.Copy(io.Discard, stderr)
+
+	e := newExpecter(stdout, stdin, cfg.Debug)
 
 	// для telnet: login → username → password → prompt
-	// для ssh: сразу prompt или password
+	// для ssh с -tt: сразу prompt или password
 	if cfg.Proto == ProtoTelnet {
-		_, _, idx, err := e.ExpectSwitchCase([]expect.Caser{
-			&expect.Case{R: loginRE, T: expect.OK()},
-			&expect.Case{R: promptRE, T: expect.OK()},
-		}, cfg.Timeout)
+		_, idx, err := e.ExpectSwitchCase([]*regexp.Regexp{loginRE, promptRE}, cfg.Timeout)
 		if err != nil {
 			return "", fmt.Errorf("telnet login prompt: %w", err)
 		}
-		// отправляем username только если поймали loginRE (idx=0)
-		// idx=1 означает устройство сразу дало промпт — username не нужен
 		if idx == 0 {
-			if err = e.Send(cfg.Username + "\r\n"); err != nil {
+			if err := e.Send(cfg.Username + "\r\n"); err != nil {
 				return "", fmt.Errorf("telnet send username: %w", err)
 			}
 		}
 	}
 
 	// ждём пароль или промпт
-	_, _, _, err = e.ExpectSwitchCase([]expect.Caser{
-		&expect.Case{
-			R:  passRE,
-			S:  cfg.Password + "\r\n",
-			T:  expect.Continue(expect.NewStatus(codes.PermissionDenied, "wrong password")),
-			Rt: 2,
-		},
-		&expect.Case{R: promptRE, T: expect.OK()},
-	}, cfg.Timeout)
+	_, idx, err := e.ExpectSwitchCase([]*regexp.Regexp{passRE, promptRE}, cfg.Timeout)
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)
+	}
+	if idx == 0 {
+		if err := e.Send(cfg.Password + "\r\n"); err != nil {
+			return "", fmt.Errorf("send password: %w", err)
+		}
+		if _, err := e.Expect(promptRE, cfg.Timeout); err != nil {
+			return "", fmt.Errorf("prompt after password: %w", err)
+		}
 	}
 
 	var buf strings.Builder
@@ -170,16 +291,18 @@ func connectAndRun(device string, cfg Config) (string, error) {
 		}
 		// ждём промпт обрабатывая пагинацию
 		for {
-			result, _, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
-				&expect.Case{R: moreRE, S: " ", T: expect.Continue(expect.NewStatus(codes.OK, "more"))},
-				&expect.Case{R: promptRE, T: expect.OK()},
-			}, cfg.Timeout)
-			if matchErr != nil {
-				return buf.String(), fmt.Errorf("expect after %q: %w", cmd, matchErr)
+			text, idx, err := e.ExpectSwitchCase([]*regexp.Regexp{moreRE, promptRE}, cfg.Timeout)
+			if err != nil {
+				return buf.String(), fmt.Errorf("expect after %q: %w", cmd, err)
 			}
-			buf.WriteString(stripANSI(result))
-			if promptRE.MatchString(result) {
+			buf.WriteString(stripANSI(text))
+			if idx == 1 {
 				break
+			}
+			// пробел листает страницу, \r\n гарантирует новую строку
+			// перед промптом (JunOS иногда печатает промпт без переноса)
+			if err := e.Send(" \r\n"); err != nil {
+				return buf.String(), fmt.Errorf("send more: %w", err)
 			}
 		}
 	}
@@ -332,7 +455,7 @@ func main() {
 
 	var successes, failures []Result
 
-	// горутина-сборщик — единственный читатель resultsCh, блокировка не нужна
+	// горутина-сборщик — единственный читатель resultsCh
 	go func() {
 		defer collectorWg.Done()
 		for r := range resultsCh {

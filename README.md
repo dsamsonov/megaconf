@@ -94,10 +94,11 @@ make clean    # remove build artifacts
 
 Supported platforms:
 
-| OS    | amd64 | 386 | arm64 | arm |
-|-------|-------|-----|-------|-----|
-| Linux | ✓     | ✓   | ✓     | ✓   |
-| macOS | ✓     |     | ✓     |     |
+| OS      | amd64 | 386 | arm64 | arm |
+|---------|-------|-----|-------|-----|
+| Linux   | ✓     | ✓   | ✓     | ✓   |
+| macOS   | ✓     |     | ✓     |     |
+| FreeBSD | ✓     |     | ✓     |     |
 
 Binaries are statically linked — no dependencies required on target system.
 

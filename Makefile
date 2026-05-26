@@ -25,6 +25,10 @@ all:
 	tar -czf $(APP)-$(VERSION)-darwin-amd64.tar.gz -C $(DIST_DIR) $(APP) -C $(CURDIR) devices.db commands
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(DIST_DIR)/$(APP) .
 	tar -czf $(APP)-$(VERSION)-darwin-arm64.tar.gz -C $(DIST_DIR) $(APP) -C $(CURDIR) devices.db commands
+	CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 go build $(LDFLAGS) -o $(DIST_DIR)/$(APP) .
+	tar -czf $(APP)-$(VERSION)-freebsd-amd64.tar.gz -C $(DIST_DIR) $(APP) -C $(CURDIR) devices.db commands
+	CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build $(LDFLAGS) -o $(DIST_DIR)/$(APP) .
+	tar -czf $(APP)-$(VERSION)-freebsd-arm64.tar.gz -C $(DIST_DIR) $(APP) -C $(CURDIR) devices.db commands
 	rm -rf $(DIST_DIR)
 	@echo ""
 	@ls -lh $(APP)-$(VERSION)-*.tar.gz
