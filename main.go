@@ -161,26 +161,14 @@ func connectAndRun(device string, cfg Config) (string, error) {
 		return "", fmt.Errorf("login: %w", err)
 	}
 
-	// отправляем пустую строку чтобы получить свежий промпт
-	// и гарантированно сбросить буфер после логина/MOTD
-	if err = e.Send("\r\n"); err != nil {
-		return "", fmt.Errorf("send empty: %w", err)
-	}
-	if _, _, err = e.Expect(promptRE, cfg.Timeout); err != nil {
-		return "", fmt.Errorf("prompt after login: %w", err)
-	}
-
 	var buf strings.Builder
 
 	for _, cmd := range cfg.Commands {
 		if err := e.Send(cmd + "\r\n"); err != nil {
 			return buf.String(), fmt.Errorf("send %q: %w", cmd, err)
 		}
-		// ждём эхо команды — это гарантирует что устройство
-		// начало обрабатывать команду и буфер обновился
-		if _, _, err = e.Expect(regexp.MustCompile(regexp.QuoteMeta(cmd)), cfg.Timeout); err != nil {
-			return buf.String(), fmt.Errorf("echo %q: %w", cmd, err)
-		}
+		// пауза чтобы устройство начало отвечать и буфер обновился
+		time.Sleep(1 * time.Second)
 		// ждём промпт обрабатывая пагинацию
 		for {
 			result, _, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
