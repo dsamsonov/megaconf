@@ -122,6 +122,7 @@ func connectAndRun(device string, cfg Config) (string, error) {
 		connectTimeout,
 		expect.Verbose(cfg.Debug),
 		expect.VerboseWriter(os.Stderr),
+		expect.PartialMatch(true),
 	)
 	if err != nil {
 		return "", fmt.Errorf("spawn: %w", err)
@@ -167,8 +168,6 @@ func connectAndRun(device string, cfg Config) (string, error) {
 		if err := e.Send(cmd + "\r\n"); err != nil {
 			return buf.String(), fmt.Errorf("send %q: %w", cmd, err)
 		}
-		// пауза чтобы устройство начало отвечать и буфер обновился
-		time.Sleep(1 * time.Second)
 		// ждём промпт обрабатывая пагинацию
 		for {
 			result, _, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
