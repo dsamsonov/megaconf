@@ -176,6 +176,11 @@ func connectAndRun(device string, cfg Config) (string, error) {
 		if err := e.Send(cmd + "\r\n"); err != nil {
 			return buf.String(), fmt.Errorf("send %q: %w", cmd, err)
 		}
+		// ждём эхо команды — это гарантирует что устройство
+		// начало обрабатывать команду и буфер обновился
+		if _, _, err = e.Expect(regexp.MustCompile(regexp.QuoteMeta(cmd)), cfg.Timeout); err != nil {
+			return buf.String(), fmt.Errorf("echo %q: %w", cmd, err)
+		}
 		// ждём промпт обрабатывая пагинацию
 		for {
 			result, _, _, matchErr := e.ExpectSwitchCase([]expect.Caser{
