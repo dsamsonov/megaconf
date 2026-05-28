@@ -1,5 +1,5 @@
 APP     := megaconf
-VERSION := 2.1
+VERSION := 2.2
 LDFLAGS := -ldflags="-s -w -extldflags=-static"
 
 DIST_DIR := dist
