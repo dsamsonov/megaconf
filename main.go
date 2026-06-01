@@ -27,13 +27,14 @@ import (
 )
 
 const (
-	version           = "2.2"
+	version           = "2.3"
 	defaultDevFile    = "./devices.db"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
 	defaultSSHPort    = 22
 	defaultTelnetPort = 23
 	defaultJobs       = 1
+	defaultCharDelay  = 30 // мс между символами в режиме --slow
 	retryDelay        = 5 * time.Second
 	retryCount        = 1
 	pollInterval      = 50 * time.Millisecond
@@ -78,6 +79,9 @@ type Config struct {
 	Debug    bool
 	Timeout  time.Duration
 	Commands []string
+	// CharDelay > 0 включает режим медленной вставки: ввод отправляется
+	// посимвольно с этой задержкой (для медленных консоль-серверов, Moxa @9600)
+	CharDelay time.Duration
 }
 
 // Result итог работы по одному устройству
@@ -128,16 +132,18 @@ func (t *tailBuffer) String() string {
 // Expecter простая реализация expect поверх io.Reader/io.Writer
 // с полным контролем над буфером
 type Expecter struct {
-	mu    sync.Mutex
-	buf   bytes.Buffer
-	w     io.Writer
-	debug bool
-	eof   chan struct{} // закрывается когда из reader пришёл EOF
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	w         io.Writer
+	debug     bool
+	charDelay time.Duration   // > 0 → посимвольная отправка с задержкой
+	ctx       context.Context // для прерывания медленной отправки по Ctrl+C/таймауту
+	eof       chan struct{}   // закрывается когда из reader пришёл EOF
 }
 
 // newExpecter создаёт Expecter и запускает фоновое чтение из r
-func newExpecter(r io.Reader, w io.Writer, debug bool) *Expecter {
-	e := &Expecter{w: w, debug: debug, eof: make(chan struct{})}
+func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, charDelay time.Duration) *Expecter {
+	e := &Expecter{w: w, debug: debug, charDelay: charDelay, ctx: ctx, eof: make(chan struct{})}
 	go func() {
 		defer close(e.eof)
 		b := make([]byte, 4096)
@@ -159,13 +165,30 @@ func newExpecter(r io.Reader, w io.Writer, debug bool) *Expecter {
 	return e
 }
 
-// Send отправляет строку в процесс
+// Send отправляет строку в процесс. В обычном режиме — одной записью.
+// В режиме медленной вставки (charDelay > 0) — побайтово с задержкой между
+// символами, чтобы медленный консоль-сервер (Moxa @9600 и т.п.) не терял
+// символы. Прерывается по ctx (Ctrl+C/таймаут).
 func (e *Expecter) Send(s string) error {
 	if e.debug {
 		fmt.Fprintf(os.Stderr, "Sent: %q\n", s)
 	}
-	_, err := fmt.Fprint(e.w, s)
-	return err
+	if e.charDelay <= 0 {
+		_, err := io.WriteString(e.w, s)
+		return err
+	}
+	b := []byte(s)
+	for i := range b {
+		if _, err := e.w.Write(b[i : i+1]); err != nil {
+			return err
+		}
+		select {
+		case <-e.ctx.Done():
+			return e.ctx.Err()
+		case <-time.After(e.charDelay):
+		}
+	}
+	return nil
 }
 
 // scan один проход по буферу; при совпадении удаляет совпавшую часть
@@ -318,11 +341,12 @@ func findSelf() string {
 
 // buildCmd строит exec.Cmd для SSH или Telnet (с привязкой к context)
 func buildCmd(ctx context.Context, cfg Config, device string) *exec.Cmd {
+	var cmd *exec.Cmd
 	switch cfg.Proto {
 	case ProtoTelnet:
-		return exec.CommandContext(ctx, "telnet", device, strconv.Itoa(cfg.Port))
+		cmd = exec.CommandContext(ctx, "telnet", device, strconv.Itoa(cfg.Port))
 	default:
-		cmd := exec.CommandContext(ctx, sshBin,
+		cmd = exec.CommandContext(ctx, sshBin,
 			"-tt",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "CheckHostIP=no",
@@ -334,17 +358,27 @@ func buildCmd(ctx context.Context, cfg Config, device string) *exec.Cmd {
 		)
 		// настоящий SSH-пароль на уровне auth через SSH_ASKPASS:
 		// бинарь служит сам себе askpass-хелпером (см. shim в main).
-		// Требует OpenSSH >= 8.4; на Windows механизм отличается — пропускаем.
+		// SSH_ASKPASS_REQUIRE=force форсит askpass на OpenSSH >= 8.4.
+		// На старых клиентах (< 8.4, напр. 7.4) askpass используется только
+		// если задан DISPLAY И нет управляющего терминала — терминал убираем
+		// через detachSession ниже (новая сессия), DISPLAY задаём здесь.
+		// На Windows механизм недоступен — пропускаем.
 		if runtime.GOOS != "windows" && cfg.Password != "" && selfBin != "" {
 			cmd.Env = append(os.Environ(),
 				"SSH_ASKPASS="+selfBin,
 				"SSH_ASKPASS_REQUIRE=force",
+				"DISPLAY=megaconf:0",
 				"MEGACONF_ASKPASS=1",
 				"MEGACONF_ASKPASS_PASS="+cfg.Password,
 			)
 		}
-		return cmd
 	}
+	// Запускаем в отдельной сессии без управляющего терминала: ssh не сможет
+	// прочитать пароль из /dev/tty и гарантированно использует SSH_ASKPASS на
+	// всех версиях OpenSSH. Заодно — отдельная группа процессов для чистого
+	// группового kill по Ctrl+C/таймауту. На Windows — no-op (см. proc_windows.go).
+	detachSession(cmd)
+	return cmd
 }
 
 // connectAndRun подключается к устройству и выполняет команды
@@ -381,16 +415,14 @@ func connectAndRun(ctx context.Context, device string, cfg Config) (output strin
 			}
 		}
 	}()
-	// выполнится ПЕРВЫМ: закрываем stdin, убиваем процесс, ждём Wait
+	// выполнится ПЕРВЫМ: закрываем stdin, убиваем процесс (всю группу), ждём Wait
 	defer func() {
 		stdin.Close()
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
+		killProcessGroup(cmd)
 		<-procDone
 	}()
 
-	e := newExpecter(stdout, stdin, cfg.Debug)
+	e := newExpecter(ctx, stdout, stdin, cfg.Debug, cfg.CharDelay)
 
 	// для telnet: login → username → password → prompt
 	// для ssh с -tt: сразу prompt или password (если устройство спрашивает в сессии)
@@ -503,6 +535,8 @@ func run() int {
 	optJSONLog := getopt.StringLong("json-log", 'J', "", "write results to a JSON file (keyed by device)")
 	optLogDir := getopt.StringLong("log-dir", 'D', "", "directory: one log file per device (<name>.log)")
 	optTelnet := getopt.BoolLong("telnet", 'T', "use Telnet instead of SSH (default: SSH)")
+	optSlow := getopt.BoolLong("slow", 'S', "slow paste mode: send input char-by-char (for slow console servers, e.g. Moxa @9600)")
+	optCharDelay := getopt.IntLong("char-delay", 0, defaultCharDelay, "inter-character delay in ms for --slow")
 	getopt.Parse()
 
 	if *optHelp {
@@ -590,14 +624,21 @@ func run() int {
 		jobs = 1
 	}
 
+	// режим медленной вставки
+	var charDelay time.Duration
+	if *optSlow {
+		charDelay = time.Duration(*optCharDelay) * time.Millisecond
+	}
+
 	cfg := Config{
-		Username: username,
-		Password: password,
-		Port:     port,
-		Proto:    proto,
-		Debug:    *optDebug,
-		Timeout:  time.Duration(*optTimeout) * time.Second,
-		Commands: commands,
+		Username:  username,
+		Password:  password,
+		Port:      port,
+		Proto:     proto,
+		Debug:     *optDebug,
+		Timeout:   time.Duration(*optTimeout) * time.Second,
+		Commands:  commands,
+		CharDelay: charDelay,
 	}
 
 	// вывод: stdout + опциональный файл

@@ -1,4 +1,4 @@
-# megaconf v2.2
+# megaconf v2.3
 
 Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
@@ -15,7 +15,7 @@ make build
 ## Usage
 
 ```
-Usage: megaconf [-?drpvT] [-c value] [-C value] [-D value] [-h value] [-j value] [-J value] [-l value] [-P value] [-t value] [-u value]
+Usage: megaconf [-?drpvST] [-c value] [-C value] [-D value] [-h value] [-j value] [-J value] [-l value] [-P value] [-t value] [-u value] [--char-delay value]
  -?, --help              display help
  -v, --version           display version
  -h, --hosts=value       file with devices list [./devices.db]
@@ -30,6 +30,8 @@ Usage: megaconf [-?drpvT] [-c value] [-C value] [-D value] [-h value] [-j value]
  -J, --json-log=value    write results to a JSON file (keyed by device)
  -D, --log-dir=value     directory: one log file per device (<name>.log)
  -T, --telnet            use Telnet instead of SSH (default: SSH)
+ -S, --slow              slow paste mode: send input char-by-char (for slow console servers)
+     --char-delay=value  inter-character delay in ms for --slow [30]
  -r, --run               run commands (required)
  -d, --debug             debug mode (forces -j 1 for readable output)
 ```
@@ -85,6 +87,12 @@ megaconf -r -u admin -p -C "sh ver"
 # Parallel execution on 10 devices at once
 megaconf -r -u admin -p -j 10
 
+# Slow paste through a slow console server (e.g. Moxa @9600)
+megaconf -r -u admin -p -S
+
+# Slow paste with a custom inter-character delay (50 ms)
+megaconf -r -u admin -p -S --char-delay 50
+
 # Custom hosts and commands files
 megaconf -r -u admin -p -h ./my_devices.db -c ./my_commands
 
@@ -137,9 +145,12 @@ Binaries are statically linked — no dependencies required on target system.
 - `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` — intentional, network
   hardware keys change after firmware updates and must not break password auth
 - Password auth via `-p` works at the SSH auth layer through `SSH_ASKPASS` (the binary
-  acts as its own askpass helper). This requires **OpenSSH ≥ 8.4** on the client. With
-  older clients use keys/agent, or rely on devices that prompt for a password inside the
-  session. Not enabled on Windows.
+  acts as its own askpass helper). To make this reliable on **all** OpenSSH versions —
+  including old clients (< 8.4, e.g. OpenSSH 7.4 on RHEL/CentOS 7) where
+  `SSH_ASKPASS_REQUIRE` does not exist — `ssh` is started in its own session with **no
+  controlling terminal**. Without a controlling terminal `ssh` cannot fall back to
+  prompting on `/dev/tty`, so it always uses the askpass helper and the password is never
+  asked twice. Not enabled on Windows (there use keys/agent).
 
 ## Telnet
 
@@ -147,12 +158,28 @@ Binaries are statically linked — no dependencies required on target system.
 - Username from `-u`, password from `-p`
 - Same credentials for all devices
 
+## Slow paste (`-S`)
+
+When pushing configuration through a slow console/terminal server (for example a Moxa
+serial server with the device port at 9600 bps), characters sent in a burst can be
+dropped. The `-S` / `--slow` flag sends **all input** — commands, the in-session password
+(Telnet / enable), and the pagination space — one byte at a time with a delay between
+characters, controlled by `--char-delay <ms>` (default 30).
+
+- Only the typing into the session is throttled; SSH/Telnet authentication itself is not
+  slowed (the SSH password is delivered at the auth layer, not over the slow line).
+- The slow send is interrupted cleanly on `Ctrl+C` / timeout.
+- A long line at a high delay can take a while (e.g. 2000 chars × 30 ms ≈ 60 s); the
+  command timeout `-t` is measured separately, while waiting for the prompt after the
+  line is sent.
+
 ## Notes
 
 - One password for all devices by design
 - Output always goes to stdout; `-l`/`-J`/`-D` add files in parallel
-- On Ctrl+C the context is cancelled: active SSH/Telnet sessions are killed, the log file
-  is flushed and closed, and a summary of what completed is still printed (exit code 130)
+- On Ctrl+C the context is cancelled: active SSH/Telnet sessions (and their child
+  processes) are killed by process group, the log file is flushed and closed, and a
+  summary of what completed is still printed (exit code 130)
 - Connection retried once (after 5s) only on transport errors, never on auth failures
 - Failed devices appear in the Unsuccessful section with reason (including the tail of the
   ssh/telnet stderr, e.g. "Connection refused")
