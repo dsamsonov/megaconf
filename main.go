@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,12 +43,26 @@ const (
 	stderrTailMax     = 4096
 )
 
+// параметры пробуждения «тихой» консольной линии (var — чтобы тесты могли ускорить)
+var (
+	consoleNudgeTries = 3
+	consoleNudgeWait  = 3 * time.Second
+)
+
+// сентинелы для классификации исхода ожидания (errors.Is)
+var (
+	errExpectTimeout = errors.New("timeout")
+	errExpectClosed  = errors.New("closed")
+)
+
 var (
 	// универсальный промпт — покрывает Cisco/JunOS/Huawei/MikroTik/Eltex/D-Link
 	// исключает JunOS diff строки и маршруты вида "via 1.2.3.4 >"
 	promptRE = regexp.MustCompile(`(?m)^[\w<\[][^\n]{0,62}(\][>\s]*[>#$]|[^\s][>#$])\s*$`)
 	passRE   = regexp.MustCompile(`(?i)assword:`)
 	loginRE  = regexp.MustCompile(`(?im)(login|username|user)\s*:\s*$`)
+	// строка неуспешного логина — для быстрого отказа в console-режиме
+	loginFailRE = regexp.MustCompile(`(?i)(login incorrect|% *login invalid|authentication fail|% *bad password|access denied)`)
 	// пагинация — все популярные варианты включая JunOS ---(more)---
 	moreRE = regexp.MustCompile(`(?i)-+\s*\(?\s*more\s*\)?\s*-+|\[more [0-9]+%\]|<more>`)
 	// ANSI escape коды (MikroTik и другие)
@@ -70,11 +86,17 @@ const (
 	ProtoTelnet
 )
 
+// Device — одно устройство из devices.db (имя для логов + хост/порт для коннекта)
+type Device struct {
+	Name string // как записано в devices.db (для отчёта/логов)
+	Host string // хост для подключения
+	Port int    // эффективный порт (из строки host:port либо дефолтный)
+}
+
 // Config хранит всё что нужно для подключения и выполнения команд
 type Config struct {
 	Username string
 	Password string
-	Port     int
 	Proto    Proto
 	Debug    bool
 	Timeout  time.Duration
@@ -82,6 +104,12 @@ type Config struct {
 	// CharDelay > 0 включает режим медленной вставки: ввод отправляется
 	// посимвольно с этой задержкой (для медленных консоль-серверов, Moxa @9600)
 	CharDelay time.Duration
+	// console-server режим (Moxa и т.п.): внутрисессионный логин на устройстве
+	Console   bool
+	LoginUser string
+	LoginPass string
+	// Live — транслировать сессию в stdout по мере поступления
+	Live bool
 }
 
 // Result итог работы по одному устройству
@@ -100,10 +128,22 @@ type jsonResult struct {
 }
 
 // safeFilename делает имя устройства пригодным для имени файла:
-// точки (IP) сохраняет, разделители путей и двоеточия (IPv6) заменяет на _
+// разделители путей, двоеточия (порт/IPv6) и скобки IPv6 заменяет на _
 func safeFilename(device string) string {
-	r := strings.NewReplacer("/", "_", `\`, "_", ":", "_")
+	r := strings.NewReplacer("/", "_", `\`, "_", ":", "_", "[", "_", "]", "_")
 	return r.Replace(device)
+}
+
+// syncWriter — потокобезопасная обёртка над io.Writer (общий мьютекс вывода)
+type syncWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 // tailBuffer хранит только последние max байт записанных данных (для stderr)
@@ -138,12 +178,13 @@ type Expecter struct {
 	debug     bool
 	charDelay time.Duration   // > 0 → посимвольная отправка с задержкой
 	ctx       context.Context // для прерывания медленной отправки по Ctrl+C/таймауту
+	live      io.Writer       // != nil → транслировать прочитанное в реальном времени
 	eof       chan struct{}   // закрывается когда из reader пришёл EOF
 }
 
 // newExpecter создаёт Expecter и запускает фоновое чтение из r
-func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, charDelay time.Duration) *Expecter {
-	e := &Expecter{w: w, debug: debug, charDelay: charDelay, ctx: ctx, eof: make(chan struct{})}
+func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, charDelay time.Duration, live io.Writer) *Expecter {
+	e := &Expecter{w: w, debug: debug, charDelay: charDelay, ctx: ctx, live: live, eof: make(chan struct{})}
 	go func() {
 		defer close(e.eof)
 		b := make([]byte, 4096)
@@ -155,6 +196,9 @@ func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, char
 				e.mu.Unlock()
 				if debug {
 					os.Stderr.Write(b[:n])
+				}
+				if e.live != nil {
+					e.live.Write(b[:n])
 				}
 			}
 			if err != nil {
@@ -226,13 +270,13 @@ func (e *Expecter) ExpectSwitchCase(patterns []*regexp.Regexp, timeout time.Dura
 			if ok {
 				return m, i, nil
 			}
-			return m, -1, fmt.Errorf("connection closed before match")
+			return m, -1, fmt.Errorf("connection closed before match: %w", errExpectClosed)
 		default:
 		}
 
 		if time.Now().After(deadline) {
 			m, _, _ := e.scan(patterns)
-			return m, -1, fmt.Errorf("timeout after %s", timeout)
+			return m, -1, fmt.Errorf("timeout after %s: %w", timeout, errExpectTimeout)
 		}
 		time.Sleep(pollInterval)
 	}
@@ -268,7 +312,8 @@ func isRetriable(err error) bool {
 	s := strings.ToLower(err.Error())
 	if strings.Contains(s, "permission denied") ||
 		strings.Contains(s, "authentication fail") ||
-		strings.Contains(s, "incorrect") {
+		strings.Contains(s, "incorrect") ||
+		strings.Contains(s, "login failed") {
 		return false
 	}
 	for _, k := range []string{
@@ -309,6 +354,27 @@ func readLines(file string) ([]string, error) {
 	return out, scanner.Err()
 }
 
+// readDevices читает devices.db и парсит необязательный порт в строке (host:port).
+// Голый hostname/IPv4 и голый IPv6 (без скобок) трактуются как «порта нет» →
+// берётся defPort. Формат с портом: host:port, ipv4:port, [ipv6]:port.
+func readDevices(file string, defPort int) ([]Device, error) {
+	lines, err := readLines(file)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Device, 0, len(lines))
+	for _, line := range lines {
+		host, port := line, defPort
+		if h, p, serr := net.SplitHostPort(line); serr == nil {
+			if pn, aerr := strconv.Atoi(p); aerr == nil {
+				host, port = h, pn
+			}
+		}
+		out = append(out, Device{Name: line, Host: host, Port: port})
+	}
+	return out, nil
+}
+
 // stripANSI удаляет ANSI escape-коды из строки
 func stripANSI(s string) string {
 	return ansiRE.ReplaceAllString(s, "")
@@ -340,11 +406,11 @@ func findSelf() string {
 }
 
 // buildCmd строит exec.Cmd для SSH или Telnet (с привязкой к context)
-func buildCmd(ctx context.Context, cfg Config, device string) *exec.Cmd {
+func buildCmd(ctx context.Context, cfg Config, dev Device) *exec.Cmd {
 	var cmd *exec.Cmd
 	switch cfg.Proto {
 	case ProtoTelnet:
-		cmd = exec.CommandContext(ctx, "telnet", device, strconv.Itoa(cfg.Port))
+		cmd = exec.CommandContext(ctx, "telnet", dev.Host, strconv.Itoa(dev.Port))
 	default:
 		cmd = exec.CommandContext(ctx, sshBin,
 			"-tt",
@@ -352,9 +418,9 @@ func buildCmd(ctx context.Context, cfg Config, device string) *exec.Cmd {
 			"-o", "CheckHostIP=no",
 			"-o", "UserKnownHostsFile="+os.DevNull,
 			"-o", "ConnectTimeout="+strconv.Itoa(int(cfg.Timeout.Seconds())),
-			"-p", strconv.Itoa(cfg.Port),
+			"-p", strconv.Itoa(dev.Port),
 			"-l", cfg.Username,
-			device,
+			dev.Host,
 		)
 		// настоящий SSH-пароль на уровне auth через SSH_ASKPASS:
 		// бинарь служит сам себе askpass-хелпером (см. shim в main).
@@ -381,9 +447,73 @@ func buildCmd(ctx context.Context, cfg Config, device string) *exec.Cmd {
 	return cmd
 }
 
+// loginDialog проводит внутрисессионный логин: ожидает login:/password:/prompt,
+// отвечает заданными кредами и завершается на промпте. При совпадении строки
+// неуспешного логина (loginFailRE) сразу возвращает неретраябельную ошибку.
+// В console-режиме (nudge=true) будит «тихую» линию одиночным CR с повторами.
+func loginDialog(e *Expecter, user, pass, eol string, timeout time.Duration, nudge bool) error {
+	pats := []*regexp.Regexp{loginFailRE, loginRE, passRE, promptRE}
+
+	// реакция на совпадение; done=true → достигли промпта
+	react := func(idx int) (done bool, err error) {
+		switch idx {
+		case 0: // строка неуспешного логина
+			return false, fmt.Errorf("login failed")
+		case 1: // login:/username:
+			return false, e.Send(user + eol)
+		case 2: // password:
+			return false, e.Send(pass + eol)
+		case 3: // промпт
+			return true, nil
+		}
+		return false, nil
+	}
+
+	// фаза пробуждения: для «тихих» линий шлём CR, пока что-нибудь не появится
+	if nudge {
+		for try := 0; ; try++ {
+			if err := e.Send(eol); err != nil {
+				return err
+			}
+			_, idx, err := e.ExpectSwitchCase(pats, consoleNudgeWait)
+			if err == nil {
+				done, rerr := react(idx)
+				if rerr != nil {
+					return rerr
+				}
+				if done {
+					return nil
+				}
+				break // получили login/pass → дальше обычный цикл
+			}
+			if !errors.Is(err, errExpectTimeout) {
+				return err // EOF/обрыв — выходим сразу
+			}
+			if try+1 >= consoleNudgeTries {
+				return fmt.Errorf("no login/prompt after %d nudges: %w", consoleNudgeTries, err)
+			}
+		}
+	}
+
+	for step := 0; step < 6; step++ {
+		_, idx, err := e.ExpectSwitchCase(pats, timeout)
+		if err != nil {
+			return err
+		}
+		done, rerr := react(idx)
+		if rerr != nil {
+			return rerr
+		}
+		if done {
+			return nil
+		}
+	}
+	return fmt.Errorf("login did not reach prompt")
+}
+
 // connectAndRun подключается к устройству и выполняет команды
-func connectAndRun(ctx context.Context, device string, cfg Config) (output string, err error) {
-	cmd := buildCmd(ctx, cfg, device)
+func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) (output string, err error) {
+	cmd := buildCmd(ctx, cfg, dev)
 
 	// stderr собираем в кольцевой буфер (а не выбрасываем),
 	// чтобы причина ошибки попала в отчёт
@@ -422,46 +552,59 @@ func connectAndRun(ctx context.Context, device string, cfg Config) (output strin
 		<-procDone
 	}()
 
-	e := newExpecter(ctx, stdout, stdin, cfg.Debug, cfg.CharDelay)
+	e := newExpecter(ctx, stdout, stdin, cfg.Debug, cfg.CharDelay, live)
 
-	// для telnet: login → username → password → prompt
-	// для ssh с -tt: сразу prompt или password (если устройство спрашивает в сессии)
-	if cfg.Proto == ProtoTelnet {
-		_, idx, lerr := e.ExpectSwitchCase([]*regexp.Regexp{loginRE, promptRE}, cfg.Timeout)
+	// конец строки: для console-серверов (serial) — одиночный CR
+	eol := "\r\n"
+	if cfg.Console {
+		eol = "\r"
+	}
+
+	switch {
+	case cfg.Console:
+		// console-server: транспорт уже аутентифицирован (ssh — через askpass,
+		// либо raw-telnet к порту), делаем device-логин отдельными кредами + nudge
+		if err = loginDialog(e, cfg.LoginUser, cfg.LoginPass, eol, cfg.Timeout, true); err != nil {
+			return "", fmt.Errorf("console login: %w", err)
+		}
+	case cfg.Proto == ProtoTelnet:
+		// telnet: внутрисессионный логин кредами -u/-p (без nudge)
+		if err = loginDialog(e, cfg.Username, cfg.Password, eol, cfg.Timeout, false); err != nil {
+			return "", fmt.Errorf("telnet login: %w", err)
+		}
+	default:
+		// ssh: auth на уровне протокола; устройство может ещё раз спросить пароль в сессии
+		_, idx, lerr := e.ExpectSwitchCase([]*regexp.Regexp{passRE, promptRE}, cfg.Timeout)
 		if lerr != nil {
-			return "", fmt.Errorf("telnet login prompt: %w", lerr)
+			return "", fmt.Errorf("login: %w", lerr)
 		}
 		if idx == 0 {
-			if err = e.Send(cfg.Username + "\r\n"); err != nil {
-				return "", fmt.Errorf("telnet send username: %w", err)
+			if err = e.Send(cfg.Password + eol); err != nil {
+				return "", fmt.Errorf("send password: %w", err)
 			}
-		}
-	}
-
-	// ждём пароль или промпт
-	_, idx, lerr := e.ExpectSwitchCase([]*regexp.Regexp{passRE, promptRE}, cfg.Timeout)
-	if lerr != nil {
-		return "", fmt.Errorf("login: %w", lerr)
-	}
-	if idx == 0 {
-		if err = e.Send(cfg.Password + "\r\n"); err != nil {
-			return "", fmt.Errorf("send password: %w", err)
-		}
-		if _, perr := e.Expect(promptRE, cfg.Timeout); perr != nil {
-			return "", fmt.Errorf("prompt after password: %w", perr)
+			if _, perr := e.Expect(promptRE, cfg.Timeout); perr != nil {
+				return "", fmt.Errorf("prompt after password: %w", perr)
+			}
 		}
 	}
 
 	var buf strings.Builder
 
-	for _, cmdStr := range cfg.Commands {
-		if err = e.Send(cmdStr + "\r\n"); err != nil {
+	for i, cmdStr := range cfg.Commands {
+		last := i == len(cfg.Commands)-1
+		if err = e.Send(cmdStr + eol); err != nil {
 			return buf.String(), fmt.Errorf("send %q: %w", cmdStr, err)
 		}
 		// ждём промпт обрабатывая пагинацию
 		for {
 			text, mi, eerr := e.ExpectSwitchCase([]*regexp.Regexp{moreRE, promptRE}, cfg.Timeout)
 			if eerr != nil {
+				// последняя команда закрыла сессию (logout/exit/reload) — это норма,
+				// а не ошибка: добираем хвост вывода и выходим успешно
+				if last && errors.Is(eerr, errExpectClosed) {
+					buf.WriteString(stripANSI(text))
+					return buf.String(), nil
+				}
 				return buf.String(), fmt.Errorf("expect after %q: %w", cmdStr, eerr)
 			}
 			buf.WriteString(stripANSI(text))
@@ -472,9 +615,9 @@ func connectAndRun(ctx context.Context, device string, cfg Config) (output strin
 				}
 				continue // ложное срабатывание — читаем дальше
 			}
-			// пробел листает страницу, \r\n гарантирует новую строку
+			// пробел листает страницу, eol гарантирует новую строку
 			// перед промптом (JunOS иногда печатает промпт без переноса)
-			if err = e.Send(" \r\n"); err != nil {
+			if err = e.Send(" " + eol); err != nil {
 				return buf.String(), fmt.Errorf("send more: %w", err)
 			}
 		}
@@ -484,15 +627,15 @@ func connectAndRun(ctx context.Context, device string, cfg Config) (output strin
 }
 
 // runDevice выполняет connectAndRun с retry (только на транспортных ошибках)
-func runDevice(ctx context.Context, device string, cfg Config, results chan<- Result) {
+func runDevice(ctx context.Context, dev Device, cfg Config, live io.Writer, results chan<- Result) {
 	var (
 		output string
 		err    error
 	)
 	for attempt := 0; ; attempt++ {
-		output, err = connectAndRun(ctx, device, cfg)
+		output, err = connectAndRun(ctx, dev, cfg, live)
 		if err == nil {
-			results <- Result{Device: device, Success: true, Output: output}
+			results <- Result{Device: dev.Name, Success: true, Output: output}
 			return
 		}
 		if attempt >= retryCount || ctx.Err() != nil || !isRetriable(err) {
@@ -506,7 +649,7 @@ func runDevice(ctx context.Context, device string, cfg Config, results chan<- Re
 			break
 		}
 	}
-	results <- Result{Device: device, Success: false, Reason: err.Error(), Output: output}
+	results <- Result{Device: dev.Name, Success: false, Reason: err.Error(), Output: output}
 }
 
 func main() {
@@ -527,7 +670,7 @@ func run() int {
 	optUsername := getopt.StringLong("username", 'u', "", "username")
 	optJobs := getopt.IntLong("jobs", 'j', defaultJobs, "number of parallel jobs")
 	optTimeout := getopt.IntLong("timeout", 't', defaultTimeout, "timeout in seconds (connect + command)")
-	optPort := getopt.IntLong("port", 'P', 0, "port (default: 22 for SSH, 23 for Telnet)")
+	optPort := getopt.IntLong("port", 'P', 0, "default port for lines without one (default: 22 SSH / 23 Telnet)")
 	optPassword := getopt.BoolLong("password", 'p', "prompt for password")
 	optRun := getopt.BoolLong("run", 'r', "run commands (required)")
 	optDebug := getopt.BoolLong("debug", 'd', "debug mode")
@@ -535,8 +678,12 @@ func run() int {
 	optJSONLog := getopt.StringLong("json-log", 'J', "", "write results to a JSON file (keyed by device)")
 	optLogDir := getopt.StringLong("log-dir", 'D', "", "directory: one log file per device (<name>.log)")
 	optTelnet := getopt.BoolLong("telnet", 'T', "use Telnet instead of SSH (default: SSH)")
-	optSlow := getopt.BoolLong("slow", 'S', "slow paste mode: send input char-by-char (for slow console servers, e.g. Moxa @9600)")
+	optSlow := getopt.BoolLong("slow", 'S', "slow paste: send input char-by-char (for slow console servers, e.g. Moxa @9600)")
 	optCharDelay := getopt.IntLong("char-delay", 0, defaultCharDelay, "inter-character delay in ms for --slow")
+	optConsole := getopt.BoolLong("console", 'M', "console-server mode (Moxa etc.): in-session device login after connect; forces -j 1")
+	optLoginUser := getopt.StringLong("login-user", 0, "", "device login username for --console (default: --username)")
+	optLoginPass := getopt.BoolLong("login-pass", 0, "prompt for a separate device login password for --console")
+	optLive := getopt.BoolLong("live", 0, "stream session output live as it happens (forces -j 1; implied by --console)")
 	getopt.Parse()
 
 	if *optHelp {
@@ -556,7 +703,7 @@ func run() int {
 		fatal(fmt.Errorf("--cmd and --cmdlist are mutually exclusive"))
 	}
 
-	// протокол и порт
+	// протокол и порт по умолчанию (для строк devices.db без явного порта)
 	proto := ProtoSSH
 	port := defaultSSHPort
 	if *optTelnet {
@@ -566,6 +713,10 @@ func run() int {
 	if *optPort != 0 {
 		port = *optPort
 	}
+
+	// console подразумевает live; live и console требуют -j 1
+	console := *optConsole
+	live := *optLive || console
 
 	// username
 	username := *optUsername
@@ -577,8 +728,8 @@ func run() int {
 		username = u.Username
 	}
 
-	// читаем устройства
-	devices, err := readLines(*optDevFile)
+	// читаем устройства (с разбором host:port)
+	devices, err := readDevices(*optDevFile, port)
 	if err != nil {
 		fatal(fmt.Errorf("devices file: %w", err))
 	}
@@ -606,7 +757,7 @@ func run() int {
 		fatal(fmt.Errorf("commands list is empty"))
 	}
 
-	// пароль
+	// пароль (транспорт: ssh-вход или telnet)
 	var password string
 	if *optPassword {
 		fmt.Printf("Enter password: ")
@@ -617,11 +768,19 @@ func run() int {
 		password = string(p)
 	}
 
-	// в debug-режиме форсим один поток — иначе сырой вывод горутин мешается
-	jobs := *optJobs
-	if *optDebug && jobs != 1 {
-		fmt.Fprintln(os.Stderr, "debug mode: forcing -j 1 for readable output")
-		jobs = 1
+	// креды устройства для console-логина
+	loginUser := *optLoginUser
+	if loginUser == "" {
+		loginUser = username
+	}
+	loginPass := password
+	if console && *optLoginPass {
+		fmt.Printf("Enter device login password: ")
+		p, err := gopass.GetPasswd()
+		if err != nil {
+			fatal(err)
+		}
+		loginPass = string(p)
 	}
 
 	// режим медленной вставки
@@ -630,15 +789,29 @@ func run() int {
 		charDelay = time.Duration(*optCharDelay) * time.Millisecond
 	}
 
+	// debug / console / live форсят один поток
+	jobs := *optJobs
+	if jobs != 1 && (*optDebug || console || live) {
+		reason := "debug"
+		if console || live {
+			reason = "console/live"
+		}
+		fmt.Fprintf(os.Stderr, "%s mode: forcing -j 1\n", reason)
+		jobs = 1
+	}
+
 	cfg := Config{
 		Username:  username,
 		Password:  password,
-		Port:      port,
 		Proto:     proto,
 		Debug:     *optDebug,
 		Timeout:   time.Duration(*optTimeout) * time.Second,
 		Commands:  commands,
 		CharDelay: charDelay,
+		Console:   console,
+		LoginUser: loginUser,
+		LoginPass: loginPass,
+		Live:      live,
 	}
 
 	// вывод: stdout + опциональный файл
@@ -656,10 +829,23 @@ func run() int {
 
 	// единый сериализованный писатель — блоки не перемешиваются
 	var outMu sync.Mutex
-	emit := func(s string) {
+	emit := func(s string) { // stdout (+ -l): баннеры, статус, summary
 		outMu.Lock()
 		io.WriteString(out, s)
 		outMu.Unlock()
+	}
+	emitLog := func(s string) { // только в -l (чистый блок в live-режиме)
+		if lf == nil {
+			return
+		}
+		outMu.Lock()
+		io.WriteString(lf, s)
+		outMu.Unlock()
+	}
+	// live: сырой поток сессии — только в stdout, в реальном времени
+	var liveOut io.Writer
+	if live {
+		liveOut = &syncWriter{mu: &outMu, w: os.Stdout}
 	}
 
 	// каталог для персональных логов (по файлу на устройство)
@@ -695,13 +881,24 @@ func run() int {
 				failures = append(failures, r)
 			}
 			block := b.String()
-			emit(block)
+
+			if cfg.Live {
+				// тело уже шло вживую в stdout; в лог пишем чистый блок,
+				// ошибку дублируем и в stdout (её в живом потоке может быть не видно)
+				if r.Success {
+					emitLog(block)
+				} else {
+					emit(block)
+				}
+			} else {
+				emit(block)
+			}
 
 			// персональный лог-файл устройства (--log-dir)
 			if *optLogDir != "" {
 				path := filepath.Join(*optLogDir, safeFilename(r.Device)+".log")
-				if err := os.WriteFile(path, []byte(block), 0o644); err != nil {
-					fmt.Fprintf(os.Stderr, "WARN: write %s: %s\n", path, err)
+				if werr := os.WriteFile(path, []byte(block), 0o644); werr != nil {
+					fmt.Fprintf(os.Stderr, "WARN: write %s: %s\n", path, werr)
 				}
 			}
 		}
@@ -729,10 +926,10 @@ func run() int {
 		c.Wait()
 		d := device
 		n := i + 1
-		emit(fmt.Sprintf("\n##############################################\n#    Connecting to %s, [%d/%d]\n##############################################\n\n", d, n, total))
+		emit(fmt.Sprintf("\n##############################################\n#    Connecting to %s, [%d/%d]\n##############################################\n\n", d.Name, n, total))
 		go func() {
 			defer c.Done()
-			runDevice(ctx, d, cfg, resultsCh)
+			runDevice(ctx, d, cfg, liveOut, resultsCh)
 		}()
 	}
 	c.WaitAllDone()

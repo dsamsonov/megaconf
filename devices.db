@@ -10,3 +10,6 @@ juniper3
 # Core switches
 192.168.0.1
 192.168.0.2
+
+# Optional per-device port (overrides -P / default): host:port, [ipv6]:port
+# console-srv.lab:4001
