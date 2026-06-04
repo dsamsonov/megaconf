@@ -63,8 +63,9 @@ var (
 	loginRE  = regexp.MustCompile(`(?im)(login|username|user)\s*:\s*$`)
 	// строка неуспешного логина — для быстрого отказа в console-режиме
 	loginFailRE = regexp.MustCompile(`(?i)(login incorrect|% *login invalid|authentication fail|% *bad password|access denied)`)
-	// пагинация — все популярные варианты включая JunOS ---(more)---
-	moreRE = regexp.MustCompile(`(?i)-+\s*\(?\s*more\s*\)?\s*-+|\[more [0-9]+%\]|<more>`)
+	// пагинация — все популярные варианты:
+	//   ---(more)---  ---(more 51%)---  --More--  ---- More ----  [more 51%]  <more>
+	moreRE = regexp.MustCompile(`(?i)-{2,}\s*\(?\s*more(\s+\d+%)?\s*\)?\s*-{2,}|\[more[^\]]*\]|<\s*more\s*>`)
 	// ANSI escape коды (MikroTik и другие)
 	ansiRE = regexp.MustCompile(`\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\x1B[()][AB012]`)
 	// строка-фрагмент маршрута, который промпт-RE ловит ложно: 1.2.3.4>
@@ -434,8 +435,13 @@ func buildCmd(ctx context.Context, cfg Config, dev Device) *exec.Cmd {
 // отвечает заданными кредами и завершается на промпте. При совпадении строки
 // неуспешного логина (loginFailRE) сразу возвращает неретраябельную ошибку.
 // В console-режиме (nudge=true) будит «тихую» линию одиночным CR с повторами.
+//
+// Линия консоль-сервера может «залипнуть» от прошлой сессии: оказаться уже
+// залогиненной (увидим промпт → сразу готово) или с открытым пейджером
+// (увидим more → выходим из него по 'q'). Это делает вход устойчивым к
+// прерванному ранее прогону.
 func loginDialog(e *Expecter, user, pass, eol string, timeout time.Duration, nudge bool) error {
-	pats := []*regexp.Regexp{loginFailRE, loginRE, passRE, promptRE}
+	pats := []*regexp.Regexp{loginFailRE, loginRE, passRE, promptRE, moreRE}
 
 	// реакция на совпадение; done=true → достигли промпта
 	react := func(idx int) (done bool, err error) {
@@ -446,8 +452,10 @@ func loginDialog(e *Expecter, user, pass, eol string, timeout time.Duration, nud
 			return false, e.Send(user + eol)
 		case 2: // password:
 			return false, e.Send(pass + eol)
-		case 3: // промпт
+		case 3: // промпт — уже вошли (свежий логин либо «залипшая» сессия)
 			return true, nil
+		case 4: // открытый пейджер от прошлой сессии — выходим из него
+			return false, e.Send("q")
 		}
 		return false, nil
 	}

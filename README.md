@@ -279,6 +279,19 @@ connection close is treated as a **normal, successful** end of session — not a
 (An unexpected disconnect in the *middle* of the command list is still reported as a
 failure.) If you do not log out, megaconf simply drops the session when done.
 
+### Pagination and "sticky" serial lines
+
+- Long output is paged automatically: megaconf recognizes the pager prompt
+  (`---(more)---`, `---(more 51%)---`, `--More--`, `[more 51%]`, …) and advances it to
+  capture the full output. On JUNOS you can avoid paging entirely with
+  `show ... | no-more`, or send `set cli screen-length 0` as the first command.
+- A serial console keeps its state between connections. If a previous run was killed
+  (Ctrl+C) mid-output, the line may still be logged in or sitting at a pager prompt. On
+  the next `-M` run megaconf copes with this: it quits a leftover pager (`q`) and, if the
+  line is already logged in, reuses the prompt instead of trying to log in again. For the
+  cleanest hand-off, end your command list with `exit`/`logout` so the line returns to
+  `login:`.
+
 ## Live output (`--live`)
 
 By default each device's output is printed as one complete block once that device
