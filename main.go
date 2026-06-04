@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version           = "2.3"
+	version           = "2.4"
 	defaultDevFile    = "./devices.db"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
@@ -74,8 +74,6 @@ var (
 
 	// путь к ssh бинарю — вычисляется один раз при старте
 	sshBin = findSSHBinary()
-	// путь к собственному бинарю — используется как SSH_ASKPASS-хелпер
-	selfBin = findSelf()
 )
 
 // Proto определяет протокол подключения
@@ -179,12 +177,13 @@ type Expecter struct {
 	charDelay time.Duration   // > 0 → посимвольная отправка с задержкой
 	ctx       context.Context // для прерывания медленной отправки по Ctrl+C/таймауту
 	live      io.Writer       // != nil → транслировать прочитанное в реальном времени
+	tail      *tailBuffer     // последние байты сессии — для диагностики ошибок
 	eof       chan struct{}   // закрывается когда из reader пришёл EOF
 }
 
 // newExpecter создаёт Expecter и запускает фоновое чтение из r
 func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, charDelay time.Duration, live io.Writer) *Expecter {
-	e := &Expecter{w: w, debug: debug, charDelay: charDelay, ctx: ctx, live: live, eof: make(chan struct{})}
+	e := &Expecter{w: w, debug: debug, charDelay: charDelay, ctx: ctx, live: live, tail: &tailBuffer{max: stderrTailMax}, eof: make(chan struct{})}
 	go func() {
 		defer close(e.eof)
 		b := make([]byte, 4096)
@@ -194,6 +193,7 @@ func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, char
 				e.mu.Lock()
 				e.buf.Write(b[:n])
 				e.mu.Unlock()
+				e.tail.Write(b[:n])
 				if debug {
 					os.Stderr.Write(b[:n])
 				}
@@ -207,6 +207,15 @@ func newExpecter(ctx context.Context, r io.Reader, w io.Writer, debug bool, char
 		}
 	}()
 	return e
+}
+
+// tailStr возвращает последние прочитанные из сессии байты (вкл. stderr ssh при
+// работе через PTY) — используется для диагностики при ошибке.
+func (e *Expecter) tailStr() string {
+	if e.tail == nil {
+		return ""
+	}
+	return e.tail.String()
 }
 
 // Send отправляет строку в процесс. В обычном режиме — одной записью.
@@ -306,14 +315,17 @@ func oneLine(s string) string {
 	return s
 }
 
-// isRetriable решает, имеет ли смысл повтор: только транспортные ошибки,
-// не ошибки аутентификации
+// isRetriable решает, имеет ли смысл повтор: только транспортные ошибки
+// (отказ соединения, нет маршрута и т.п.), но НЕ фаза логина/аутентификации —
+// повтор логина бессмысленен и опасен (однопользовательские порты Moxa,
+// блокировка учётки).
 func isRetriable(err error) bool {
 	s := strings.ToLower(err.Error())
-	if strings.Contains(s, "permission denied") ||
+	if strings.Contains(s, "login") || // login:/console login:/telnet login:/login failed
+		strings.Contains(s, "password") || // prompt/send password
+		strings.Contains(s, "permission denied") ||
 		strings.Contains(s, "authentication fail") ||
-		strings.Contains(s, "incorrect") ||
-		strings.Contains(s, "login failed") {
+		strings.Contains(s, "incorrect") {
 		return false
 	}
 	for _, k := range []string{
@@ -396,23 +408,16 @@ func findSSHBinary() string {
 	return "ssh"
 }
 
-// findSelf возвращает путь к собственному бинарю (для роли SSH_ASKPASS)
-func findSelf() string {
-	p, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	return p
-}
-
-// buildCmd строит exec.Cmd для SSH или Telnet (с привязкой к context)
+// buildCmd строит exec.Cmd для SSH или Telnet (с привязкой к context).
+// Процесс НЕ запускается здесь — его стартует startSession() на PTY.
 func buildCmd(ctx context.Context, cfg Config, dev Device) *exec.Cmd {
-	var cmd *exec.Cmd
 	switch cfg.Proto {
 	case ProtoTelnet:
-		cmd = exec.CommandContext(ctx, "telnet", dev.Host, strconv.Itoa(dev.Port))
+		return exec.CommandContext(ctx, "telnet", dev.Host, strconv.Itoa(dev.Port))
 	default:
-		cmd = exec.CommandContext(ctx, sshBin,
+		// Пароль вводится прямо в PTY по приглашению ssh (см. connectAndRun),
+		// поэтому работает на всех версиях OpenSSH без сторонних обвязок.
+		return exec.CommandContext(ctx, sshBin,
 			"-tt",
 			"-o", "StrictHostKeyChecking=no",
 			"-o", "CheckHostIP=no",
@@ -422,29 +427,7 @@ func buildCmd(ctx context.Context, cfg Config, dev Device) *exec.Cmd {
 			"-l", cfg.Username,
 			dev.Host,
 		)
-		// настоящий SSH-пароль на уровне auth через SSH_ASKPASS:
-		// бинарь служит сам себе askpass-хелпером (см. shim в main).
-		// SSH_ASKPASS_REQUIRE=force форсит askpass на OpenSSH >= 8.4.
-		// На старых клиентах (< 8.4, напр. 7.4) askpass используется только
-		// если задан DISPLAY И нет управляющего терминала — терминал убираем
-		// через detachSession ниже (новая сессия), DISPLAY задаём здесь.
-		// На Windows механизм недоступен — пропускаем.
-		if runtime.GOOS != "windows" && cfg.Password != "" && selfBin != "" {
-			cmd.Env = append(os.Environ(),
-				"SSH_ASKPASS="+selfBin,
-				"SSH_ASKPASS_REQUIRE=force",
-				"DISPLAY=megaconf:0",
-				"MEGACONF_ASKPASS=1",
-				"MEGACONF_ASKPASS_PASS="+cfg.Password,
-			)
-		}
 	}
-	// Запускаем в отдельной сессии без управляющего терминала: ssh не сможет
-	// прочитать пароль из /dev/tty и гарантированно использует SSH_ASKPASS на
-	// всех версиях OpenSSH. Заодно — отдельная группа процессов для чистого
-	// группового kill по Ctrl+C/таймауту. На Windows — no-op (см. proc_windows.go).
-	detachSession(cmd)
-	return cmd
 }
 
 // loginDialog проводит внутрисессионный логин: ожидает login:/password:/prompt,
@@ -515,44 +498,34 @@ func loginDialog(e *Expecter, user, pass, eol string, timeout time.Duration, nud
 func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) (output string, err error) {
 	cmd := buildCmd(ctx, cfg, dev)
 
-	// stderr собираем в кольцевой буфер (а не выбрасываем),
-	// чтобы причина ошибки попала в отчёт
-	tb := &tailBuffer{max: stderrTailMax}
-	cmd.Stderr = tb
-
-	stdin, err := cmd.StdinPipe()
+	// startSession запускает процесс на PTY (unix) и возвращает мастер-сторону:
+	// чтение = вывод сессии (включая stderr ssh), запись = ввод. На Windows —
+	// обычные пайпы. Процесс стартует внутри startSession.
+	session, err := startSession(cmd)
 	if err != nil {
-		return "", fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("stdout pipe: %w", err)
-	}
-
-	if err = cmd.Start(); err != nil {
 		return "", fmt.Errorf("start: %w", err)
 	}
 
 	procDone := make(chan struct{})
 	go func() { cmd.Wait(); close(procDone) }()
 
-	// регистрируется первым → выполнится ПОСЛЕДНИМ:
-	// к этому моменту процесс убит и cmd.Stderr полностью прочитан
+	e := newExpecter(ctx, session, session, cfg.Debug, cfg.CharDelay, live)
+
+	// выполнится ПЕРВЫМ: закрываем сессию, убиваем группу процессов, ждём Wait
 	defer func() {
-		if err != nil {
-			if tail := oneLine(tb.String()); tail != "" {
-				err = fmt.Errorf("%w [%s]", err, tail)
-			}
-		}
-	}()
-	// выполнится ПЕРВЫМ: закрываем stdin, убиваем процесс (всю группу), ждём Wait
-	defer func() {
-		stdin.Close()
+		session.Close()
 		killProcessGroup(cmd)
 		<-procDone
 	}()
-
-	e := newExpecter(ctx, stdout, stdin, cfg.Debug, cfg.CharDelay, live)
+	// выполнится ПОСЛЕДНИМ (после kill): добавляем в ошибку хвост сессии —
+	// при работе через PTY туда попадает и stderr ssh ("Permission denied" и т.п.)
+	defer func() {
+		if err != nil {
+			if t := oneLine(e.tailStr()); t != "" {
+				err = fmt.Errorf("%w [%s]", err, t)
+			}
+		}
+	}()
 
 	// конец строки: для console-серверов (serial) — одиночный CR
 	eol := "\r\n"
@@ -562,8 +535,24 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 
 	switch {
 	case cfg.Console:
-		// console-server: транспорт уже аутентифицирован (ssh — через askpass,
-		// либо raw-telnet к порту), делаем device-логин отдельными кредами + nudge
+		// console-server. Для SSH сначала отвечаем на парольный запрос самого ssh
+		// (аккаунт консоль-сервера/Moxa), который теперь приходит в PTY. Для telnet
+		// к raw-порту транспортной аутентификации нет — сразу логин устройства.
+		if cfg.Proto == ProtoSSH {
+			_, idx, terr := e.ExpectSwitchCase([]*regexp.Regexp{passRE, loginFailRE}, cfg.Timeout)
+			switch {
+			case terr == nil && idx == 1:
+				return "", fmt.Errorf("console login: transport auth failed")
+			case terr == nil:
+				if err = e.Send(cfg.Password + "\r\n"); err != nil {
+					return "", fmt.Errorf("console login: send transport password: %w", err)
+				}
+			case !errors.Is(terr, errExpectTimeout):
+				return "", fmt.Errorf("console login: %w", terr)
+				// таймаут парольного запроса → вероятно вход по ключу, идём к device-логину
+			}
+		}
+		// device-логин отдельными кредами устройства, с пробуждением «тихой» линии
 		if err = loginDialog(e, cfg.LoginUser, cfg.LoginPass, eol, cfg.Timeout, true); err != nil {
 			return "", fmt.Errorf("console login: %w", err)
 		}
@@ -573,13 +562,13 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 			return "", fmt.Errorf("telnet login: %w", err)
 		}
 	default:
-		// ssh: auth на уровне протокола; устройство может ещё раз спросить пароль в сессии
+		// ssh: пароль спрашивается в PTY; некоторые устройства спрашивают повторно в сессии
 		_, idx, lerr := e.ExpectSwitchCase([]*regexp.Regexp{passRE, promptRE}, cfg.Timeout)
 		if lerr != nil {
 			return "", fmt.Errorf("login: %w", lerr)
 		}
 		if idx == 0 {
-			if err = e.Send(cfg.Password + eol); err != nil {
+			if err = e.Send(cfg.Password + "\r\n"); err != nil {
 				return "", fmt.Errorf("send password: %w", err)
 			}
 			if _, perr := e.Expect(promptRE, cfg.Timeout); perr != nil {
@@ -653,11 +642,6 @@ func runDevice(ctx context.Context, dev Device, cfg Config, live io.Writer, resu
 }
 
 func main() {
-	// SSH_ASKPASS-shim: при вызове через ssh печатаем пароль из env и выходим
-	if os.Getenv("MEGACONF_ASKPASS") == "1" {
-		fmt.Println(os.Getenv("MEGACONF_ASKPASS_PASS"))
-		return
-	}
 	os.Exit(run())
 }
 

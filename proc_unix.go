@@ -3,32 +3,36 @@
 package main
 
 import (
+	"io"
 	"os/exec"
 	"syscall"
+
+	"github.com/creack/pty"
 )
 
-// detachSession запускает процесс в новой сессии (setsid) без управляющего
-// терминала. Это нужно, чтобы OpenSSH не мог прочитать пароль из /dev/tty и
-// гарантированно использовал SSH_ASKPASS — в том числе на старых клиентах
-// (< 8.4), где нет SSH_ASKPASS_REQUIRE. Новая сессия = новая группа процессов
-// (pgid == pid), что также позволяет аккуратно убить всю группу.
-func detachSession(cmd *exec.Cmd) {
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setsid = true
+// startSession запускает команду, подключённую к псевдотерминалу (PTY), и
+// возвращает мастер-сторону как единый io.ReadWriteCloser (чтение = вывод
+// процесса, запись = ввод процессу; stderr процесса тоже попадает сюда).
+//
+// PTY критичен: с настоящим управляющим терминалом `ssh -tt` ведёт себя как
+// при живом входе — сам спрашивает пароль в терминале (askpass/SSH_ASKPASS не
+// нужны ни на одной версии OpenSSH), а удалённая сессия получает интерактивный
+// tty, поэтому консоль-серверы (Moxa и пр.) отдают баннер/приглашение. pty.Start
+// также стартует процесс в новой сессии (setsid) с pty в роли ctty — это даёт
+// и собственную группу процессов для аккуратного группового kill.
+func startSession(cmd *exec.Cmd) (io.ReadWriteCloser, error) {
+	return pty.Start(cmd)
 }
 
 // killProcessGroup убивает всю группу процессов (ssh/telnet и любых их потомков,
-// например ProxyJump или askpass-хелпер). Поскольку процесс стартовал с Setsid,
-// его pgid == pid, поэтому отрицательный pid адресует группу.
+// например ProxyJump). Процесс стартовал в своей сессии (pty.Start → Setsid),
+// поэтому pgid == pid и отрицательный pid адресует группу.
 func killProcessGroup(cmd *exec.Cmd) {
 	if cmd.Process == nil {
 		return
 	}
 	pid := cmd.Process.Pid
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-		// на всякий случай — если группового убийства не вышло, бьём по pid
 		_ = cmd.Process.Kill()
 	}
 }

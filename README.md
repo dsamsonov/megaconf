@@ -1,4 +1,4 @@
-# megaconf v2.3
+# megaconf v2.4
 
 Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
@@ -175,13 +175,17 @@ Binaries are statically linked — no dependencies required on target system.
 - SSH agent forwarding via `SSH_AUTH_SOCK`
 - `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` — intentional, network
   hardware keys change after firmware updates and must not break password auth
-- Password auth via `-p` works at the SSH auth layer through `SSH_ASKPASS` (the binary
-  acts as its own askpass helper). To make this reliable on **all** OpenSSH versions —
-  including old clients (< 8.4, e.g. OpenSSH 7.4 on RHEL/CentOS 7) where
-  `SSH_ASKPASS_REQUIRE` does not exist — `ssh` is started in its own session with **no
-  controlling terminal**. Without a controlling terminal `ssh` cannot fall back to
-  prompting on `/dev/tty`, so it always uses the askpass helper and the password is never
-  asked twice. Not enabled on Windows (there use keys/agent).
+- Password auth via `-p`: `ssh` is run attached to a **pseudo-terminal (PTY)**, exactly
+  like an interactive login, and megaconf answers the `password:` prompt itself. This is
+  the same technique `sshpass` uses, and it works on **all** OpenSSH versions — including
+  old clients such as OpenSSH 7.4 on RHEL/CentOS 7 — with no `SSH_ASKPASS`/`DISPLAY`
+  tricks. The PTY also means the remote session is a real interactive terminal, which is
+  what console servers (Moxa etc.) need in order to produce their banner/login prompt.
+- The PTY is unix-only. On **Windows** megaconf falls back to plain pipes and password
+  auth is not supported there — use keys/agent.
+
+> Note: giving `ssh` a real terminal (rather than a pipe + `SSH_ASKPASS`) is what makes
+> serial consoles behind a Moxa actually talk; with a bare pipe many of them stay silent.
 
 ## Telnet
 
@@ -205,8 +209,9 @@ dropped. The `-S` / `--slow` flag sends **all input** — commands, any in-sessi
 (Telnet, enable, or the `-M` device login), and the pagination space — one byte at a time
 with a delay between characters, controlled by `--char-delay <ms>` (default 30).
 
-- Only the typing into the session is throttled; SSH/Telnet authentication itself is not
-  slowed (the SSH password is delivered at the auth layer, not over the slow line).
+- Under `-S`, every byte megaconf types is throttled — including the password it enters
+  at an `ssh` or device `password:` prompt (harmless: the SSH password reaches the server
+  over TCP, not the slow serial line). Key/agent auth involves no typing and is unaffected.
 - The slow send is interrupted cleanly on `Ctrl+C` / timeout.
 - A long line at a high delay can take a while (e.g. 2000 chars × 30 ms ≈ 60 s); the
   command timeout `-t` is measured separately, while waiting for the prompt after the
