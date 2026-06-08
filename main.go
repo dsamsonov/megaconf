@@ -109,6 +109,9 @@ type Config struct {
 	LoginPass string
 	// Live — транслировать сессию в stdout по мере поступления
 	Live bool
+	// EOL — строка-терминатор команды, разрешённая из --eol флага.
+	// Значение уже вычислено (auto применён), всегда одно из "\n", "\r", "\r\n".
+	EOL string
 }
 
 // Result итог работы по одному устройству
@@ -548,12 +551,12 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 		}
 	}()
 
-	// Конец строки — одиночный \n. На PTY это ровно ОДИН Enter. Прежний "\r\n"
-	// на псевдотерминале превращался в ДВА Enter (CR транслируется драйвером в
-	// NL, плюс сам NL) → на каждую команду приходило два промпта, второй залипал
-	// в буфере и ложно "удовлетворял" следующую команду, рассинхронизируя сессию
-	// (команды терялись, а итог рапортовался как success).
-	eol := "\n"
+	// Конец строки берётся из cfg.EOL, вычисленного в run() из --eol / auto-дефолта.
+	// auto: обычный режим → "\n", console (-M) → "\r".
+	// Прямое указание --eol lf|cr|crlf переопределяет дефолт.
+	// Предупреждение: crlf на PTY даёт ДВА Enter (CR→NL + NL) и может
+	// вызвать рассинхрон сессии — используйте только если железка требует CRLF.
+	eol := cfg.EOL
 
 	switch {
 	case cfg.Console:
@@ -690,6 +693,7 @@ func run() int {
 	optLoginUser := getopt.StringLong("login-user", 0, "", "device login username for --console (default: --username)")
 	optLoginPass := getopt.BoolLong("login-pass", 0, "prompt for a separate device login password for --console")
 	optLive := getopt.BoolLong("live", 0, "stream session output live as it happens (forces -j 1; implied by --console)")
+	optEOL := getopt.StringLong("eol", 0, "auto", "line ending: auto (default), lf, cr, crlf")
 	getopt.Parse()
 
 	if *optHelp {
@@ -795,6 +799,35 @@ func run() int {
 		charDelay = time.Duration(*optCharDelay) * time.Millisecond
 	}
 
+	// конец строки: резолвим auto-дефолт и проверяем допустимые значения
+	eolStr := strings.ToLower(strings.TrimSpace(*optEOL))
+	var eol string
+	switch eolStr {
+	case "auto":
+		// auto: console-режим использует CR (совместимость с serial/Moxa),
+		// всё остальное — LF (один Enter на PTY, фикс рассинхрона v2.4)
+		if console {
+			eol = "\r"
+		} else {
+			eol = "\n"
+		}
+	case "lf":
+		eol = "\n"
+	case "cr":
+		eol = "\r"
+	case "crlf":
+		// ПРЕДУПРЕЖДЕНИЕ: на PTY \r\n = два Enter → двойной промпт → рассинхрон.
+		// Оставлено как escape-hatch для нестандартных транспортов.
+		fmt.Fprintln(os.Stderr, "WARNING: --eol crlf produces two Enter keystrokes on a PTY and may cause session desync on most devices")
+		eol = "\r\n"
+	default:
+		fatal(fmt.Errorf("--eol: unknown value %q, must be one of: auto, lf, cr, crlf", *optEOL))
+	}
+	if *optDebug {
+		eolNames := map[string]string{"\n": "lf", "\r": "cr", "\r\n": "crlf"}
+		fmt.Fprintf(os.Stderr, "EOL: %s\n", eolNames[eol])
+	}
+
 	// debug / console / live форсят один поток
 	jobs := *optJobs
 	if jobs != 1 && (*optDebug || console || live) {
@@ -818,6 +851,7 @@ func run() int {
 		LoginUser: loginUser,
 		LoginPass: loginPass,
 		Live:      live,
+		EOL:       eol,
 	}
 
 	// вывод: stdout + опциональный файл

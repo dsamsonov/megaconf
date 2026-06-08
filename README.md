@@ -15,7 +15,7 @@ make build
 ## Usage
 
 ```
-Usage: megaconf [-?drpvST] [-M] [--live] [-c value] [-C value] [-D value] [-h value] [-j value] [-J value] [-l value] [-P value] [-t value] [-u value] [--char-delay value] [--login-user value] [--login-pass]
+Usage: megaconf [-?drpvST] [-M] [--live] [-c value] [-C value] [-D value] [-h value] [-j value] [-J value] [-l value] [-P value] [-t value] [-u value] [--char-delay value] [--login-user value] [--login-pass] [--eol value]
  -?, --help              display help
  -v, --version           display version
  -h, --hosts=value       file with devices list [./devices.db]
@@ -36,6 +36,7 @@ Usage: megaconf [-?drpvST] [-M] [--live] [-c value] [-C value] [-D value] [-h va
      --login-user=value  device login username for --console (default: --username)
      --login-pass        prompt for a separate device login password for --console
      --live              stream session output live as it happens (forces -j 1; implied by --console)
+     --eol=value         line ending sent after each command: auto (default), lf, cr, crlf
  -r, --run               run commands (required)
  -d, --debug             debug mode (forces -j 1 for readable output)
 ```
@@ -311,6 +312,13 @@ implied by `-M`.
 - Output always goes to stdout; `-l`/`-J`/`-D` add files in parallel
 - Log files (`-l`/`-J`/`-D`) and the `--log-dir` directory are created with restrictive
   permissions (0600 / 0700), since session output can contain secrets
+- **`--eol`** controls the line ending sent after each command and in-session input:
+  - `auto` (default) — `lf` for normal SSH/Telnet, `cr` for console-server mode (`-M`)
+  - `lf` — `\n` (one Enter on PTY; recommended for most network devices)
+  - `cr` — `\r` (one Enter; default for `-M` / serial consoles)
+  - `crlf` — `\r\n` (**warning**: on a PTY this produces two Enter keystrokes and will
+    cause session desync on most devices; only use for transports that require it)
+  - explicit `--eol` always overrides the auto default, including inside `-M`
 - On Ctrl+C the context is cancelled: active SSH/Telnet sessions (and their child
   processes) are killed by process group, the log file is flushed and closed, and a
   summary of what completed is still printed (exit code 130)
