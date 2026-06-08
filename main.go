@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version           = "2.4"
+	version           = "2.5"
 	defaultDevFile    = "./devices.db"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
@@ -219,13 +219,26 @@ func (e *Expecter) tailStr() string {
 	return e.tail.String()
 }
 
-// Send отправляет строку в процесс. В обычном режиме — одной записью.
+// Send отправляет строку в процесс (в debug-режиме логирует содержимое).
+func (e *Expecter) Send(s string) error { return e.send(s, false) }
+
+// SendSecret как Send, но в debug-режиме НЕ печатает содержимое (пароли и т.п.):
+// вместо плейнтекста выводит заглушку <protected>, чтобы секрет не утёк в
+// консоль/лог при запуске с -d.
+func (e *Expecter) SendSecret(s string) error { return e.send(s, true) }
+
+// send отправляет строку в процесс. В обычном режиме — одной записью.
 // В режиме медленной вставки (charDelay > 0) — побайтово с задержкой между
 // символами, чтобы медленный консоль-сервер (Moxa @9600 и т.п.) не терял
-// символы. Прерывается по ctx (Ctrl+C/таймаут).
-func (e *Expecter) Send(s string) error {
+// символы. Прерывается по ctx (Ctrl+C/таймаут). При secret=true содержимое
+// строки не попадает в debug-вывод.
+func (e *Expecter) send(s string, secret bool) error {
 	if e.debug {
-		fmt.Fprintf(os.Stderr, "Sent: %q\n", s)
+		if secret {
+			fmt.Fprintf(os.Stderr, "Sent: <protected>\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "Sent: %q\n", s)
+		}
 	}
 	if e.charDelay <= 0 {
 		_, err := io.WriteString(e.w, s)
@@ -450,8 +463,8 @@ func loginDialog(e *Expecter, user, pass, eol string, timeout time.Duration, nud
 			return false, fmt.Errorf("login failed")
 		case 1: // login:/username:
 			return false, e.Send(user + eol)
-		case 2: // password:
-			return false, e.Send(pass + eol)
+		case 2: // password: — секрет, в debug не светим
+			return false, e.SendSecret(pass + eol)
 		case 3: // промпт — уже вошли (свежий логин либо «залипшая» сессия)
 			return true, nil
 		case 4: // открытый пейджер от прошлой сессии — выходим из него
@@ -535,11 +548,12 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 		}
 	}()
 
-	// конец строки: для console-серверов (serial) — одиночный CR
-	eol := "\r\n"
-	if cfg.Console {
-		eol = "\r"
-	}
+	// Конец строки — одиночный \n. На PTY это ровно ОДИН Enter. Прежний "\r\n"
+	// на псевдотерминале превращался в ДВА Enter (CR транслируется драйвером в
+	// NL, плюс сам NL) → на каждую команду приходило два промпта, второй залипал
+	// в буфере и ложно "удовлетворял" следующую команду, рассинхронизируя сессию
+	// (команды терялись, а итог рапортовался как success).
+	eol := "\n"
 
 	switch {
 	case cfg.Console:
@@ -552,7 +566,7 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 			case terr == nil && idx == 1:
 				return "", fmt.Errorf("console login: transport auth failed")
 			case terr == nil:
-				if err = e.Send(cfg.Password + "\r\n"); err != nil {
+				if err = e.SendSecret(cfg.Password + eol); err != nil {
 					return "", fmt.Errorf("console login: send transport password: %w", err)
 				}
 			case !errors.Is(terr, errExpectTimeout):
@@ -576,7 +590,7 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 			return "", fmt.Errorf("login: %w", lerr)
 		}
 		if idx == 0 {
-			if err = e.Send(cfg.Password + "\r\n"); err != nil {
+			if err = e.SendSecret(cfg.Password + eol); err != nil {
 				return "", fmt.Errorf("send password: %w", err)
 			}
 			if _, perr := e.Expect(promptRE, cfg.Timeout); perr != nil {
@@ -810,7 +824,9 @@ func run() int {
 	out := io.Writer(os.Stdout)
 	var lf *os.File
 	if *optLogFile != "" {
-		f, err := os.Create(*optLogFile)
+		// 0o600: лог содержит полный вывод сессии (вкл. show running-config с
+		// секретами) — закрываем чтение для остальных пользователей хоста
+		f, err := os.OpenFile(*optLogFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
 			fatal(fmt.Errorf("log file: %w", err))
 		}
@@ -841,8 +857,9 @@ func run() int {
 	}
 
 	// каталог для персональных логов (по файлу на устройство)
+	// 0o700: содержимое — вывод сессий с возможными секретами
 	if *optLogDir != "" {
-		if err := os.MkdirAll(*optLogDir, 0o755); err != nil {
+		if err := os.MkdirAll(*optLogDir, 0o700); err != nil {
 			fatal(fmt.Errorf("log dir: %w", err))
 		}
 	}
@@ -887,9 +904,10 @@ func run() int {
 			}
 
 			// персональный лог-файл устройства (--log-dir)
+			// 0o600: тот же чувствительный вывод сессии
 			if *optLogDir != "" {
 				path := filepath.Join(*optLogDir, safeFilename(r.Device)+".log")
-				if werr := os.WriteFile(path, []byte(block), 0o644); werr != nil {
+				if werr := os.WriteFile(path, []byte(block), 0o600); werr != nil {
 					fmt.Fprintf(os.Stderr, "WARN: write %s: %s\n", path, werr)
 				}
 			}
@@ -949,6 +967,7 @@ func run() int {
 	}
 
 	// JSON-лог (--json-log): единый документ, пишется после сбора всех результатов
+	// 0o600: содержит вывод сессий (поле out) с возможными секретами
 	if *optJSONLog != "" {
 		m := make(map[string]jsonResult, len(successes)+len(failures))
 		for _, r := range successes {
@@ -960,7 +979,7 @@ func run() int {
 		data, err := json.MarshalIndent(m, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARN: json marshal: %s\n", err)
-		} else if err := os.WriteFile(*optJSONLog, append(data, '\n'), 0o644); err != nil {
+		} else if err := os.WriteFile(*optJSONLog, append(data, '\n'), 0o600); err != nil {
 			fmt.Fprintf(os.Stderr, "WARN: write json log %s: %s\n", *optJSONLog, err)
 		}
 	}

@@ -1,4 +1,4 @@
-# megaconf v2.4
+# megaconf v2.5
 
 Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
@@ -198,8 +198,7 @@ Binaries are statically linked — no dependencies required on target system.
   in-session login with `-u`/`-p`. Add `-M` to also get the "quiet line" nudge and
   fast-fail on bad credentials (see below). `-S` is honored over Telnet as well — the
   system telnet client forwards the throttled bytes without re-batching them.
-- Line endings over Telnet are governed by the telnet client's NVT handling; the
-  console-mode single-CR is effectively a no-op there but does no harm.
+- Line endings over Telnet are governed by the telnet client's NVT handling.
 
 ## Slow paste (`-S`)
 
@@ -310,6 +309,8 @@ implied by `-M`.
 
 - One password for all devices by design
 - Output always goes to stdout; `-l`/`-J`/`-D` add files in parallel
+- Log files (`-l`/`-J`/`-D`) and the `--log-dir` directory are created with restrictive
+  permissions (0600 / 0700), since session output can contain secrets
 - On Ctrl+C the context is cancelled: active SSH/Telnet sessions (and their child
   processes) are killed by process group, the log file is flushed and closed, and a
   summary of what completed is still printed (exit code 130)
