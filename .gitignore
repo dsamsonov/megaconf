@@ -1,0 +1,24 @@
+# Claude Code local instructions (локальный файл, не для репозитория)
+CLAUDE.md
+
+# Build output
+megaconf
+megaconf.exe
+dist/
+*.tar.gz
+
+# Go
+go.sum
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
