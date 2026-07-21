@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version           = "2.6"
+	version           = "2.7"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
 	defaultSSHPort    = 22
@@ -320,9 +320,9 @@ func (e *Expecter) Expect(re *regexp.Regexp, timeout time.Duration) (string, err
 	return text, err
 }
 
-// confirmRun печатает список команд и устройств, на которые они будут разлиты,
-// и спрашивает подтверждение (y/N). Любой ответ кроме "y"/"yes" — отказ.
-func confirmRun(commands []string, devices []Device) bool {
+// printPlan печатает список команд и устройств, на которые они будут разлиты
+// (используется и в сухом прогоне без -r, и перед вопросом подтверждения).
+func printPlan(commands []string, devices []Device) {
 	fmt.Println("\nCommands to run:")
 	for _, c := range commands {
 		fmt.Printf("  %s\n", c)
@@ -333,6 +333,12 @@ func confirmRun(commands []string, devices []Device) bool {
 		names[i] = d.Name
 	}
 	fmt.Printf("\nDevices (%d):\n%s\n\n", len(devices), strings.Join(names, " "))
+}
+
+// confirmRun показывает план (printPlan) и спрашивает подтверждение (y/N).
+// Любой ответ кроме "y"/"yes" — отказ.
+func confirmRun(commands []string, devices []Device) bool {
+	printPlan(commands, devices)
 
 	fmt.Print("Continue? (y/N): ")
 	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -708,7 +714,7 @@ func run() int {
 	optTimeout := getopt.IntLong("timeout", 't', defaultTimeout, "timeout in seconds (connect + command)")
 	optPort := getopt.IntLong("port", 'P', 0, "default port for lines without one (default: 22 SSH / 23 Telnet)")
 	optPassword := getopt.BoolLong("password", 'p', "prompt for password")
-	optRun := getopt.BoolLong("run", 'r', "run commands (required)")
+	optRun := getopt.BoolLong("run", 'r', "actually run commands on devices (without it: dry run, only show the plan)")
 	optDebug := getopt.BoolLong("debug", 'd', "debug mode")
 	optLogFile := getopt.StringLong("log", 'l', "", "log file (output goes to stdout AND log file)")
 	optJSONLog := getopt.StringLong("json-log", 'J', "", "write results to a JSON file (keyed by device)")
@@ -730,11 +736,6 @@ func run() int {
 	}
 	if *optVersion {
 		fmt.Println(version)
-		return 0
-	}
-	if !*optRun {
-		fmt.Print("\nUse -r flag to actually run commands on devices.\n\n")
-		getopt.Usage()
 		return 0
 	}
 	if *optCmd != "" && *optCmdFile != "" {
@@ -798,8 +799,15 @@ func run() int {
 		fatal(fmt.Errorf("commands list is empty"))
 	}
 
-	// защита от случайного разлива на прод: показываем что и куда польётся
-	// и просим подтверждение, если не указан --extreme
+	// без -r/--run — только показываем план (сухой прогон), ничего не льём
+	if !*optRun {
+		printPlan(commands, devices)
+		fmt.Println("Dry run: use -r/--run to execute these commands on the devices above.")
+		return 0
+	}
+
+	// защита от случайного разлива на прод: показываем план и просим
+	// подтверждение, если не указан --extreme
 	if !*optExtreme && !confirmRun(commands, devices) {
 		fmt.Println("Aborted.")
 		return 1
