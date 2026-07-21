@@ -320,6 +320,26 @@ func (e *Expecter) Expect(re *regexp.Regexp, timeout time.Duration) (string, err
 	return text, err
 }
 
+// confirmRun печатает список команд и устройств, на которые они будут разлиты,
+// и спрашивает подтверждение (y/N). Любой ответ кроме "y"/"yes" — отказ.
+func confirmRun(commands []string, devices []Device) bool {
+	fmt.Println("\nCommands to run:")
+	for _, c := range commands {
+		fmt.Printf("  %s\n", c)
+	}
+
+	names := make([]string, len(devices))
+	for i, d := range devices {
+		names[i] = d.Name
+	}
+	fmt.Printf("\nDevices (%d):\n%s\n\n", len(devices), strings.Join(names, " "))
+
+	fmt.Print("Continue? (y/N): ")
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "y" || answer == "yes"
+}
+
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "\nERROR: %s\n\n", err)
 	os.Exit(1)
@@ -701,6 +721,7 @@ func run() int {
 	optLoginPass := getopt.BoolLong("login-pass", 0, "prompt for a separate device login password for --console")
 	optLive := getopt.BoolLong("live", 0, "stream session output live as it happens (forces -j 1; implied by --console)")
 	optEOL := getopt.StringLong("eol", 0, "auto", "line ending: auto (default), lf, cr, crlf")
+	optExtreme := getopt.BoolLong("extreme", 'e', "skip the confirmation prompt and run immediately")
 	getopt.Parse()
 
 	if *optHelp {
@@ -775,6 +796,13 @@ func run() int {
 	}
 	if len(commands) == 0 {
 		fatal(fmt.Errorf("commands list is empty"))
+	}
+
+	// защита от случайного разлива на прод: показываем что и куда польётся
+	// и просим подтверждение, если не указан --extreme
+	if !*optExtreme && !confirmRun(commands, devices) {
+		fmt.Println("Aborted.")
+		return 1
 	}
 
 	// пароль (транспорт: ssh-вход или telnet)
