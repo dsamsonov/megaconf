@@ -18,7 +18,7 @@ make build
 Usage: megaconf [-?drpvST] [-M] [--live] [-c value] [-C value] [-D value] [-h value] [-j value] [-J value] [-l value] [-P value] [-t value] [-u value] [--char-delay value] [--login-user value] [--login-pass] [--eol value]
  -?, --help              display help
  -v, --version           display version
- -h, --hosts=value       file with devices list [./devices.db]
+ -h, --hosts=value       file with devices list (required)
  -c, --cmdlist=value     file with commands list (mutually exclusive with --cmd)
  -C, --cmd=value         inline command, e.g. -C "sh ver" (mutually exclusive with --cmdlist)
  -u, --username=value    username (default: current OS user)
@@ -78,58 +78,60 @@ sh int description | no-more
 
 ## Examples
 
+`-h <file>` is always required — there is no default devices file.
+
 ```bash
 # Run commands via SSH (default)
-megaconf -r -u admin -p
+megaconf -r -u admin -p -h ./devices.db
 
 # Run commands via Telnet
-megaconf -r -u admin -p --telnet
+megaconf -r -u admin -p -h ./devices.db --telnet
 
 # Telnet on non-standard port
-megaconf -r -u admin -p --telnet -P 2023
+megaconf -r -u admin -p -h ./devices.db --telnet -P 2023
 
 # Save combined output to log file (stdout is also printed)
-megaconf -r -u admin -p -l ./output.log
+megaconf -r -u admin -p -h ./devices.db -l ./output.log
 
 # Structured results as JSON (keyed by device)
-megaconf -r -u admin -p -J ./results.json
+megaconf -r -u admin -p -h ./devices.db -J ./results.json
 
 # One log file per device into a directory
-megaconf -r -u admin -p -D ./logs
+megaconf -r -u admin -p -h ./devices.db -D ./logs
 
 # Inline command
-megaconf -r -u admin -p -C "sh ver"
+megaconf -r -u admin -p -h ./devices.db -C "sh ver"
 
 # Parallel execution on 10 devices at once
-megaconf -r -u admin -p -j 10
+megaconf -r -u admin -p -h ./devices.db -j 10
 
 # Slow paste through a slow console server (e.g. Moxa @9600)
-megaconf -r -u admin -p -S
+megaconf -r -u admin -p -h ./devices.db -S
 
 # Slow paste with a custom inter-character delay (50 ms)
-megaconf -r -u admin -p -S --char-delay 50
+megaconf -r -u admin -p -h ./devices.db -S --char-delay 50
 
 # Console server (Moxa) over SSH: SSH auth = Moxa account (-u/-p),
 # device login behind it = --login-user / --login-pass. -M implies -j 1 and live.
-megaconf -r -u admin -p -M --login-user noc --login-pass
+megaconf -r -u admin -p -h ./devices.db -M --login-user noc --login-pass
 
 # Console server reachable as raw telnet port (one login = the device itself)
-megaconf -r -T -P 4001 -u noc -p -M
+megaconf -r -T -P 4001 -u noc -p -h ./devices.db -M
 
 # Console server + slow paste (typical for serial-attached gear at 9600)
-megaconf -r -u admin -p -M --login-user noc --login-pass -S
+megaconf -r -u admin -p -h ./devices.db -M --login-user noc --login-pass -S
 
 # Watch the session live as it happens (plain SSH, no console server)
-megaconf -r -u admin -p --live
+megaconf -r -u admin -p -h ./devices.db --live
 
 # Per-device ports live in devices.db (host:port); no flag needed
-megaconf -r -u admin -p   # devices.db may contain console-srv:4001 etc.
+megaconf -r -u admin -p -h ./devices.db   # devices.db may contain console-srv:4001 etc.
 
 # Custom hosts and commands files
 megaconf -r -u admin -p -h ./my_devices.db -c ./my_commands
 
 # Custom timeout
-megaconf -r -u admin -p -t 120
+megaconf -r -u admin -p -h ./devices.db -t 120
 ```
 
 ## Logging
@@ -240,7 +242,7 @@ in-session device login. The device credentials are separate from the transport 
 So an SSH-fronted Moxa where the SSH account is `admin` and the device login is `noc`:
 
 ```bash
-megaconf -r -u admin -p -M --login-user noc --login-pass
+megaconf -r -u admin -p -h ./devices.db -M --login-user noc --login-pass
 #         └ SSH auth (Moxa) ┘  └ device login behind the port ┘
 ```
 
@@ -261,7 +263,7 @@ What `-M` adds on top of a plain login:
 nudge and fast-fail. Combine with `-S` for slow serial lines:
 
 ```bash
-megaconf -r -u admin -p -M --login-user noc --login-pass -S
+megaconf -r -u admin -p -h ./devices.db -M --login-user noc --login-pass -S
 ```
 
 ### Logging out of the device

@@ -30,7 +30,6 @@ import (
 
 const (
 	version           = "2.6"
-	defaultDevFile    = "./devices.db"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
 	defaultSSHPort    = 22
@@ -681,7 +680,7 @@ func main() {
 func run() int {
 	optHelp := getopt.BoolLong("help", '?', "display help")
 	optVersion := getopt.BoolLong("version", 'v', "display version")
-	optDevFile := getopt.StringLong("hosts", 'h', defaultDevFile, "file with devices list")
+	optDevFile := getopt.StringLong("hosts", 'h', "", "file with devices list (required)")
 	optCmdFile := getopt.StringLong("cmdlist", 'c', "", "file with commands list (mutually exclusive with --cmd)")
 	optCmd := getopt.StringLong("cmd", 'C', "", "inline command (mutually exclusive with --cmdlist)")
 	optUsername := getopt.StringLong("username", 'u', "", "username")
@@ -719,6 +718,9 @@ func run() int {
 	}
 	if *optCmd != "" && *optCmdFile != "" {
 		fatal(fmt.Errorf("--cmd and --cmdlist are mutually exclusive"))
+	}
+	if *optDevFile == "" {
+		fatal(fmt.Errorf("--hosts is required: specify a file with devices list"))
 	}
 
 	// протокол и порт по умолчанию (для строк devices.db без явного порта)
