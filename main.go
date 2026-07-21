@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version           = "2.5"
+	version           = "2.6"
 	defaultDevFile    = "./devices.db"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
@@ -56,9 +56,13 @@ var (
 )
 
 var (
-	// универсальный промпт — покрывает Cisco/JunOS/Huawei/MikroTik/Eltex/D-Link
-	// исключает JunOS diff строки и маршруты вида "via 1.2.3.4 >"
-	promptRE = regexp.MustCompile(`(?m)^[\w<\[][^\n]{0,62}(\][>\s]*[>#$]|[^\s][>#$])\s*$`)
+	// универсальный промпт — покрывает Cisco/JunOS/Huawei/MikroTik/Eltex/D-Link.
+	// Вторая альтернатива — Huawei VRP system/interface view: строка вида
+	// [~host], [*host], [host], [host-GigabitEthernet0/0/1] — заканчивается на ]
+	// без >#$. Внутри скобок запрещены пробелы, поэтому JunOS diff-заголовки
+	// ([edit interfaces]) и пейджер ([more 51%]) не матчатся; одиночные
+	// служебные [edit]/[OK] отсекаются в isRealPrompt (fakeBracketRE)
+	promptRE = regexp.MustCompile(`(?m)^([\w<\[][^\n]{0,62}(\][>\s]*[>#$]|[^\s][>#$])|\[[~*]?\w[^\s\[\]]{0,62}\])\s*$`)
 	passRE   = regexp.MustCompile(`(?i)assword:`)
 	loginRE  = regexp.MustCompile(`(?im)(login|username|user)\s*:\s*$`)
 	// строка неуспешного логина — для быстрого отказа в console-режиме
@@ -70,6 +74,9 @@ var (
 	ansiRE = regexp.MustCompile(`\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\x1B[()][AB012]`)
 	// строка-фрагмент маршрута, который промпт-RE ловит ложно: 1.2.3.4>
 	routeLikeRE = regexp.MustCompile(`\d{1,3}(\.\d{1,3}){3}\s*[>#$]$`)
+	// служебные [..]-строки вывода, ложно похожие на Huawei-промпт:
+	// [edit] (JunOS show | compare), [OK] (Cisco write mem) и т.п.
+	fakeBracketRE = regexp.MustCompile(`(?i)^\[(edit|ok|yes|no|y/n|done)\]$`)
 	// схлопывание пробелов для однострочного stderr
 	wsRE = regexp.MustCompile(`\s+`)
 
@@ -356,11 +363,12 @@ func isRetriable(err error) bool {
 	return false
 }
 
-// isRealPrompt отсекает ложный матч промпта на строке-фрагменте маршрута (1.2.3.4>)
+// isRealPrompt отсекает ложные матчи промпта: строки-фрагменты маршрутов
+// (1.2.3.4>) и служебные [..]-строки вывода ([edit], [OK] и т.п.)
 func isRealPrompt(text string) bool {
 	lines := strings.Split(strings.TrimRight(text, "\r\n"), "\n")
 	last := strings.TrimSpace(lines[len(lines)-1])
-	return !routeLikeRE.MatchString(last)
+	return !routeLikeRE.MatchString(last) && !fakeBracketRE.MatchString(last)
 }
 
 // readLines читает файл, пропуская пустые строки и комментарии (#)

@@ -1,4 +1,4 @@
-# megaconf v2.5
+# megaconf v2.6
 
 Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
