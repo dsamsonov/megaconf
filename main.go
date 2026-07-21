@@ -730,6 +730,11 @@ func run() int {
 	optExtreme := getopt.BoolLong("extreme", 'e', "skip the confirmation prompt and run immediately")
 	getopt.Parse()
 
+	// без единого аргумента — показываем справку, а не ошибку про --hosts
+	if len(os.Args) == 1 {
+		getopt.Usage()
+		return 0
+	}
 	if *optHelp {
 		getopt.Usage()
 		return 0
