@@ -1,4 +1,4 @@
-# megaconf v2.6
+# megaconf v2.7
 
 Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
@@ -15,7 +15,7 @@ make build
 ## Usage
 
 ```
-Usage: megaconf [-?drpvST] [-M] [--live] [-c value] [-C value] [-D value] [-h value] [-j value] [-J value] [-l value] [-P value] [-t value] [-u value] [--char-delay value] [--login-user value] [--login-pass] [--eol value]
+Usage: megaconf [-?deMprSTv] [--char-delay value] [-C value] [-c value] [-D value] [--eol value] [-h value] [-j value] [-J value] [--live] [-l value] [--login-pass] [--login-user value] [-P value] [-t value] [-u value] [parameters ...]
  -?, --help              display help
  -v, --version           display version
  -h, --hosts=value       file with devices list (required)
@@ -37,8 +37,38 @@ Usage: megaconf [-?drpvST] [-M] [--live] [-c value] [-C value] [-D value] [-h va
      --login-pass        prompt for a separate device login password for --console
      --live              stream session output live as it happens (forces -j 1; implied by --console)
      --eol=value         line ending sent after each command: auto (default), lf, cr, crlf
- -r, --run               run commands (required)
+ -r, --run               actually run commands on devices (without it: dry run, only show the plan)
+ -e, --extreme           skip the confirmation prompt and run immediately
  -d, --debug             debug mode (forces -j 1 for readable output)
+```
+
+Running `megaconf` with no arguments at all prints this help and exits (code 0).
+
+## Safety: dry run and confirmation
+
+`-r` / `--run` is no longer just "required" — it now gates whether anything actually
+reaches the devices:
+
+- **Without `-r`** — megaconf reads `devices.db` and the commands file, prints the plan
+  (commands one per line, then the devices on a single space-separated line), and exits
+  (code 0). Nothing is connected to. This is the default, safe "what would happen"
+  preview.
+- **With `-r`, without `--extreme`** — the same plan is printed, followed by a
+  `Continue? (y/N): ` prompt. Anything other than `y`/`yes` (including just pressing
+  Enter) aborts with exit code 1 and connects to nothing.
+- **With `-r --extreme`** (or `-re`) — the plan is printed but the confirmation prompt is
+  skipped; execution starts immediately. Use this for scripts/CI where no interactive
+  input is available.
+
+```bash
+# Preview only — no connection made
+megaconf -h ./devices.db -c ./commands
+
+# Same preview, then asks Continue? (y/N) before touching anything
+megaconf -r -h ./devices.db -c ./commands
+
+# No prompt — runs immediately (automation)
+megaconf -r -e -h ./devices.db -c ./commands
 ```
 
 ## File formats
