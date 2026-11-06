@@ -52,7 +52,8 @@ reaches the devices:
 - **Without `-r`** — megaconf reads `devices.db` and the commands file, prints the plan
   (commands one per line, then the devices on a single space-separated line), and exits
   (code 0). Nothing is connected to. This is the default, safe "what would happen"
-  preview.
+  preview. If some devices have their own `commands=` file (see below), the plan is
+  split into one block per distinct command set, each with its own device list.
 - **With `-r`, without `--extreme`** — the same plan is printed, followed by a
   `Continue? (y/N): ` prompt. Anything other than `y`/`yes` (including just pressing
   Enter) aborts with exit code 1 and connects to nothing.
@@ -125,6 +126,28 @@ vrp2:2222   commands=./huawei.cmds
 - The plan (dry run / confirmation) groups devices by the command set they will really
   get (`Commands to run (set 1/2)` …), so what you confirm is what is sent.
 - The device name in logs and JSON is still just `host[:port]`.
+- The common commands list is still required (a `commands` file, `-c` or `-C`), even if
+  every device has its own `commands=`.
+
+Example plan (dry run) for the `devices.db` above:
+
+```
+Commands to run (set 1/2):
+  sh version
+  show chassis routing
+
+Devices (2):
+juniper1 juniper2
+
+
+Commands to run (set 2/2):
+  display version
+
+Devices (2):
+vrp1 vrp2:2222
+
+Dry run: use -r/--run to execute these commands on the devices above.
+```
 
 **commands**
 ```
