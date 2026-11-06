@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version           = "2.7"
+	version           = "2.8"
 	defaultCmdFile    = "./commands"
 	defaultTimeout    = 60
 	defaultSSHPort    = 22
@@ -96,6 +96,31 @@ type Device struct {
 	Name string // как записано в devices.db (для отчёта/логов)
 	Host string // хост для подключения
 	Port int    // эффективный порт (из строки host:port либо дефолтный)
+	// Commands — личный список команд устройства (опция commands=<файл> в строке
+	// devices.db). nil → берётся общий список (см. cmds)
+	Commands []string
+}
+
+// cmds возвращает команды, которые реально уйдут на это устройство:
+// личные (commands=) либо общие
+func (d Device) cmds(global []string) []string {
+	if d.Commands != nil {
+		return d.Commands
+	}
+	return global
+}
+
+// dropOverrides сбрасывает личные списки (используется при -C: явная команда
+// из CLI сильнее devices.db) и возвращает, сколько устройств затронуто
+func dropOverrides(devices []Device) int {
+	n := 0
+	for i := range devices {
+		if devices[i].Commands != nil {
+			devices[i].Commands = nil
+			n++
+		}
+	}
+	return n
 }
 
 // Config хранит всё что нужно для подключения и выполнения команд
@@ -320,19 +345,40 @@ func (e *Expecter) Expect(re *regexp.Regexp, timeout time.Duration) (string, err
 	return text, err
 }
 
-// printPlan печатает список команд и устройств, на которые они будут разлиты
+// printPlan печатает команды и устройства, на которые они будут разлиты
 // (используется и в сухом прогоне без -r, и перед вопросом подтверждения).
+// Устройства группируются по реально отправляемому набору команд, чтобы план
+// совпадал с тем, что уйдёт на железо (личные commands= в devices.db).
 func printPlan(commands []string, devices []Device) {
-	fmt.Println("\nCommands to run:")
-	for _, c := range commands {
-		fmt.Printf("  %s\n", c)
+	type group struct {
+		cmds  []string
+		names []string
+	}
+	var groups []*group
+	byKey := map[string]*group{}
+	for _, d := range devices {
+		c := d.cmds(commands)
+		key := strings.Join(c, "\n")
+		g, ok := byKey[key]
+		if !ok {
+			g = &group{cmds: c}
+			byKey[key] = g
+			groups = append(groups, g)
+		}
+		g.names = append(g.names, d.Name)
 	}
 
-	names := make([]string, len(devices))
-	for i, d := range devices {
-		names[i] = d.Name
+	for i, g := range groups {
+		title := "Commands to run:"
+		if len(groups) > 1 {
+			title = fmt.Sprintf("Commands to run (set %d/%d):", i+1, len(groups))
+		}
+		fmt.Printf("\n%s\n", title)
+		for _, c := range g.cmds {
+			fmt.Printf("  %s\n", c)
+		}
+		fmt.Printf("\nDevices (%d):\n%s\n\n", len(g.names), strings.Join(g.names, " "))
 	}
-	fmt.Printf("\nDevices (%d):\n%s\n\n", len(devices), strings.Join(names, " "))
 }
 
 // confirmRun показывает план (printPlan) и спрашивает подтверждение (y/N).
@@ -416,25 +462,71 @@ func readLines(file string) ([]string, error) {
 	return out, scanner.Err()
 }
 
-// readDevices читает devices.db и парсит необязательный порт в строке (host:port).
+// readDevices читает devices.db. Строка: `host[:port] [commands=<файл>]`.
 // Голый hostname/IPv4 и голый IPv6 (без скобок) трактуются как «порта нет» →
 // берётся defPort. Формат с портом: host:port, ipv4:port, [ipv6]:port.
+// Опция commands= задаёт личный список команд устройства (путь — от cwd).
+// Все файлы читаются и проверяются здесь, до первого подключения.
 func readDevices(file string, defPort int) ([]Device, error) {
 	lines, err := readLines(file)
 	if err != nil {
 		return nil, err
 	}
+	cache := map[string][]string{} // файл команд читается один раз на запуск
 	out := make([]Device, 0, len(lines))
 	for _, line := range lines {
-		host, port := line, defPort
-		if h, p, serr := net.SplitHostPort(line); serr == nil {
-			if pn, aerr := strconv.Atoi(p); aerr == nil {
-				host, port = h, pn
-			}
+		dev, err := parseDeviceLine(line, defPort, cache)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", line, err)
 		}
-		out = append(out, Device{Name: line, Host: host, Port: port})
+		out = append(out, dev)
 	}
 	return out, nil
+}
+
+func parseDeviceLine(line string, defPort int, cache map[string][]string) (Device, error) {
+	fields := strings.Fields(line)
+	spec := fields[0]
+	host, port := spec, defPort
+	if h, p, serr := net.SplitHostPort(spec); serr == nil {
+		if pn, aerr := strconv.Atoi(p); aerr == nil {
+			host, port = h, pn
+		}
+	}
+	dev := Device{Name: spec, Host: host, Port: port}
+	for _, opt := range fields[1:] {
+		key, val, ok := strings.Cut(opt, "=")
+		if !ok || val == "" {
+			return Device{}, fmt.Errorf("bad option %q (want key=value)", opt)
+		}
+		switch key {
+		case "commands":
+			cmds, err := loadCommands(val, cache)
+			if err != nil {
+				return Device{}, err
+			}
+			dev.Commands = cmds
+		default:
+			return Device{}, fmt.Errorf("unknown option %q (supported: commands)", key)
+		}
+	}
+	return dev, nil
+}
+
+// loadCommands читает файл команд (с кэшем); пустой список — ошибка
+func loadCommands(path string, cache map[string][]string) ([]string, error) {
+	if c, ok := cache[path]; ok {
+		return c, nil
+	}
+	c, err := readLines(path)
+	if err != nil {
+		return nil, fmt.Errorf("commands file: %w", err)
+	}
+	if len(c) == 0 {
+		return nil, fmt.Errorf("commands file %s is empty", path)
+	}
+	cache[path] = c
+	return c, nil
 }
 
 // stripANSI удаляет ANSI escape-коды из строки
@@ -637,8 +729,9 @@ func connectAndRun(ctx context.Context, dev Device, cfg Config, live io.Writer) 
 
 	var buf strings.Builder
 
-	for i, cmdStr := range cfg.Commands {
-		last := i == len(cfg.Commands)-1
+	commands := dev.cmds(cfg.Commands)
+	for i, cmdStr := range commands {
+		last := i == len(commands)-1
 		if err = e.Send(cmdStr + eol); err != nil {
 			return buf.String(), fmt.Errorf("send %q: %w", cmdStr, err)
 		}
@@ -802,6 +895,12 @@ func run() int {
 	}
 	if len(commands) == 0 {
 		fatal(fmt.Errorf("commands list is empty"))
+	}
+	// -C — явная команда из CLI: сильнее личных commands= из devices.db
+	if *optCmd != "" {
+		if n := dropOverrides(devices); n > 0 {
+			fmt.Fprintf(os.Stderr, "WARNING: -C given: ignoring commands= overrides of %d device(s) in %s\n", n, *optDevFile)
+		}
 	}
 
 	// без -r/--run — только показываем план (сухой прогон), ничего не льём

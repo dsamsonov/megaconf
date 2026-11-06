@@ -13,3 +13,8 @@ juniper3
 
 # Optional per-device port (overrides -P / default): host:port, [ipv6]:port
 # console-srv.lab:4001
+
+# Optional per-device commands file (instead of the common ./commands),
+# path is relative to the directory megaconf is started from:
+# vrp1 commands=./huawei.cmds
+# console-srv.lab:4001 commands=./huawei.cmds

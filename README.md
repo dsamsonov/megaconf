@@ -1,4 +1,4 @@
-# megaconf v2.7
+# megaconf v2.8
 
 Utility for fast execution of commands on many network devices (routers, switches, servers, etc.)
 
@@ -98,6 +98,34 @@ value is used, otherwise the protocol default (22 for SSH, 23 for Telnet). A bar
 IPv6 address without a port must be written **without** brackets (`2001:db8::1`);
 to attach a port, bracket it (`[2001:db8::1]:4001`).
 
+### Per-device commands override (`commands=`)
+
+A line may carry options after the host, separated by spaces or tabs:
+`host[:port] commands=<file>`. The device then gets its own commands file instead of
+the common one, so one mass run can push different command sets to different vendors:
+
+```
+# JunOS: common commands file (-c / ./commands)
+juniper1
+juniper2
+
+# Huawei: their own list
+vrp1   commands=./huawei.cmds
+vrp2:2222   commands=./huawei.cmds
+```
+
+- Without `commands=` the device uses the common list (`-c <file>` or `./commands`).
+- `commands=` paths are resolved from the **current directory** (where megaconf is
+  started), not from the `devices.db` directory.
+- `-C "<cmd>"` is stronger than any `commands=`: overrides are ignored and a warning
+  is printed.
+- All override files are read and validated **before** any connection: a missing or
+  empty file, an unknown option or a malformed option aborts the run with the offending
+  line in the error. Each file is read once per run.
+- The plan (dry run / confirmation) groups devices by the command set they will really
+  get (`Commands to run (set 1/2)` …), so what you confirm is what is sent.
+- The device name in logs and JSON is still just `host[:port]`.
+
 **commands**
 ```
 # Comments work here too
@@ -156,6 +184,9 @@ megaconf -r -u admin -p -h ./devices.db --live
 
 # Per-device ports live in devices.db (host:port); no flag needed
 megaconf -r -u admin -p -h ./devices.db   # devices.db may contain console-srv:4001 etc.
+
+# Some devices in devices.db carry their own commands=<file> (see File formats)
+megaconf -r -u admin -p -h ./devices.db -c ./commands
 
 # Custom hosts and commands files
 megaconf -r -u admin -p -h ./my_devices.db -c ./my_commands
