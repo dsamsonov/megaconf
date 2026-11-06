@@ -18,9 +18,9 @@ make build
 Usage: megaconf [-?deMprSTv] [--char-delay value] [-C value] [-c value] [-D value] [--eol value] [-h value] [-j value] [-J value] [--live] [-l value] [--login-pass] [--login-user value] [-P value] [-t value] [-u value] [parameters ...]
  -?, --help              display help
  -v, --version           display version
- -h, --hosts=value       file with devices list (required)
- -c, --cmdlist=value     file with commands list (mutually exclusive with --cmd)
- -C, --cmd=value         inline command, e.g. -C "sh ver" (mutually exclusive with --cmdlist)
+ -h, --hosts=value       file with devices list (required); a line may add commands=<file>
+ -c, --cmdlist=value     file with commands list, used by devices without commands= (mutually exclusive with --cmd)
+ -C, --cmd=value         inline command, e.g. -C "sh ver"; overrides commands= from devices.db (mutually exclusive with --cmdlist)
  -u, --username=value    username (default: current OS user)
  -p, --password          prompt for password
  -j, --jobs=value        number of parallel device jobs [1]

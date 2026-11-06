@@ -799,9 +799,9 @@ func main() {
 func run() int {
 	optHelp := getopt.BoolLong("help", '?', "display help")
 	optVersion := getopt.BoolLong("version", 'v', "display version")
-	optDevFile := getopt.StringLong("hosts", 'h', "", "file with devices list (required)")
-	optCmdFile := getopt.StringLong("cmdlist", 'c', "", "file with commands list (mutually exclusive with --cmd)")
-	optCmd := getopt.StringLong("cmd", 'C', "", "inline command (mutually exclusive with --cmdlist)")
+	optDevFile := getopt.StringLong("hosts", 'h', "", "file with devices list (required); a line may add commands=<file>")
+	optCmdFile := getopt.StringLong("cmdlist", 'c', "", "file with commands list, used by devices without commands= (mutually exclusive with --cmd)")
+	optCmd := getopt.StringLong("cmd", 'C', "", "inline command, overrides commands= from devices.db (mutually exclusive with --cmdlist)")
 	optUsername := getopt.StringLong("username", 'u', "", "username")
 	optJobs := getopt.IntLong("jobs", 'j', defaultJobs, "number of parallel jobs")
 	optTimeout := getopt.IntLong("timeout", 't', defaultTimeout, "timeout in seconds (connect + command)")
